@@ -103,6 +103,13 @@ void MessageRelay::relay_message(const std::string& message_json,
         if (obj.contains("id")) clean_msg["id"] = obj["id"];
         if (obj.contains("pow")) clean_msg["pow"] = obj["pow"];
         
+        // Encrypted Envelope Fields - CRITICAL FIX
+        if (obj.contains("payload")) clean_msg["payload"] = obj["payload"];
+        if (obj.contains("pq_ciphertext")) clean_msg["pq_ciphertext"] = obj["pq_ciphertext"];
+        if (obj.contains("sender_identity_key")) clean_msg["sender_identity_key"] = obj["sender_identity_key"];
+        if (obj.contains("ephemeral_key")) clean_msg["ephemeral_key"] = obj["ephemeral_key"];
+        if (obj.contains("target_hash")) clean_msg["target_hash"] = obj["target_hash"];
+        
         // Ensure the sender identity is preserved for the receiver
         clean_msg["sender"] = sender->get_user_data();
         
@@ -122,7 +129,7 @@ void MessageRelay::relay_message(const std::string& message_json,
         if (!routing.to.empty()) {
             
             // Apply recipient-side flood protection
-            auto rcv_limit = rate_limiter_.check("rcv:" + routing.to, 100, 10); 
+            auto rcv_limit = rate_limiter_.check("rcv:" + routing.to, 1000, 10); 
             if (!rcv_limit.allowed) {
                 MetricsRegistry::instance().increment_counter("recipient_flood_blocked");
                 return; 
@@ -205,11 +212,12 @@ void MessageRelay::relay_binary(const std::string& recipient_hash,
     auto recipient = conn_manager_.get_connection(safe_hash);
     if (recipient) {
         try {
-            std::string payload(static_cast<const char*>(data), length);
+            std::string sender_hash = sender->get_user_data();
+            std::string delivered_payload = sender_hash + std::string(static_cast<const char*>(data), length);
             
             // Binary normalization
-            if (payload.size() < REQUIRED_PACKET_SIZE) {
-                payload.resize(REQUIRED_PACKET_SIZE, '\0');
+            if (delivered_payload.size() < REQUIRED_PACKET_SIZE) {
+                delivered_payload.resize(REQUIRED_PACKET_SIZE, '\0');
             }
             
             thread_local std::mt19937 gen{std::random_device{}()};
@@ -218,9 +226,9 @@ void MessageRelay::relay_binary(const std::string& recipient_hash,
             auto timer = std::make_shared<boost::asio::steady_timer>(recipient->get_executor());
             timer->expires_after(std::chrono::milliseconds(dis(gen)));
             
-            timer->async_wait([recipient, payload, sender, timer](const boost::system::error_code& ec) {
+            timer->async_wait([recipient, delivered_payload, sender, timer](const boost::system::error_code& ec) {
                 if (!ec) {
-                    recipient->send_binary(payload, true); // Binary is always media-paced
+                    recipient->send_binary(delivered_payload, true); // Binary is always media-paced
                     
                     json::object response;
                     response["type"] = "relay_success";
@@ -270,16 +278,18 @@ void MessageRelay::relay_binary(const std::string& recipient_hash,
 // Low-overhead relay for ephemeral data. Does not provide ACKs or persistence.
 void MessageRelay::relay_volatile(const std::string& recipient_hash,
                                   const void* data,
-                                  size_t length) {
+                                  size_t length,
+                                  std::shared_ptr<WebSocketSession> sender) {
     std::string safe_hash = InputValidator::sanitize_field(recipient_hash, 256);
     if (safe_hash.empty()) return;
 
     auto recipient = conn_manager_.get_connection(safe_hash);
     if (recipient) {
         try {
-            std::string payload(static_cast<const char*>(data), length);
-            if (payload.size() < REQUIRED_PACKET_SIZE) {
-                payload.resize(REQUIRED_PACKET_SIZE, '\0');
+            std::string sender_hash = sender ? sender->get_user_data() : std::string(64, '0');
+            std::string delivered_payload = sender_hash + std::string(static_cast<const char*>(data), length);
+            if (delivered_payload.size() < REQUIRED_PACKET_SIZE) {
+                delivered_payload.resize(REQUIRED_PACKET_SIZE, '\0');
             }
             
             thread_local std::mt19937 gen{std::random_device{}()};
@@ -288,9 +298,9 @@ void MessageRelay::relay_volatile(const std::string& recipient_hash,
             auto timer = std::make_shared<boost::asio::steady_timer>(recipient->get_executor());
             timer->expires_after(std::chrono::milliseconds(dis(gen)));
             
-            timer->async_wait([recipient, payload, timer](const boost::system::error_code& ec) {
+            timer->async_wait([recipient, delivered_payload, timer](const boost::system::error_code& ec) {
                 if (!ec) {
-                    recipient->send_binary(payload);
+                    recipient->send_binary(delivered_payload);
                 }
             });
         } catch (...) {}
@@ -299,6 +309,7 @@ void MessageRelay::relay_volatile(const std::string& recipient_hash,
         json::object wrapper;
         wrapper["type"] = "binary_payload";
         wrapper["volatile"] = true;
+        wrapper["sender"] = sender ? sender->get_user_data() : "unknown";
         std::stringstream ss;
         for (unsigned char c : binary_data) {
             ss << std::hex << std::setw(2) << std::setfill('0') << (int)c;

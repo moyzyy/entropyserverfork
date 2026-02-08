@@ -48,16 +48,42 @@ private:
 
     template<class Body>
     void add_security_headers(http::response<Body>& res) {
+        res.set(beast::http::field::server, "Entropy/2.0");
         res.set("X-Content-Type-Options", "nosniff");
         res.set("X-Frame-Options", "DENY");
-        res.set("Content-Security-Policy", "default-src 'none'");
+        res.set("X-XSS-Protection", "1; mode=block");
+        res.set("Referrer-Policy", "strict-origin-when-cross-origin");
+        res.set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
     }
     
     template<class Body>
-    void add_cors_headers(http::response<Body>& res) {
-        res.set(http::field::access_control_allow_origin, "*");
+    void add_cors_headers(http::response<Body>& res, const http::request<http::string_body>* req = nullptr) {
+        std::string origin;
+        if (req) {
+            auto origin_it = req->find(http::field::origin);
+            if (origin_it != req->end()) {
+                origin = std::string(origin_it->value());
+            }
+        }
+
+        // Basic allowance for local development and Tauri apps
+        if (!origin.empty()) {
+            if (origin.find("localhost") != std::string::npos || 
+                origin.find("tauri://") != std::string::npos || 
+                origin.find("127.0.0.1") != std::string::npos) {
+                res.set(http::field::access_control_allow_origin, origin);
+                res.set(http::field::access_control_allow_credentials, "true");
+            } else {
+                res.set(http::field::access_control_allow_origin, "*");
+            }
+        } else {
+            res.set(http::field::access_control_allow_origin, "*");
+        }
+        
         res.set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
-        res.set(http::field::access_control_allow_headers, "Content-Type, X-PoW-Seed, X-PoW-Nonce");
+        res.set(http::field::access_control_allow_headers, "Content-Type, Authorization, X-PoW-Seed, X-PoW-Nonce, x-pow-seed, x-pow-nonce, X-Admin-Token");
+        res.set(http::field::access_control_max_age, "86400");
+        res.set(http::field::vary, "Origin");
     }
     
     http::response<http::string_body> handle_rate_limited(const RateLimitResult& res_info, unsigned version);

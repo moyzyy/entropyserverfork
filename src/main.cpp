@@ -111,6 +111,18 @@ private:
     void on_accept(beast::error_code ec, tcp::socket socket) {
         if (ec) {
             SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::CONNECTION_REJECTED, "internal", "Accept error: " + ec.message());
+            
+            // If the listener is still open, wait a bit before retrying to avoid spinning on fatal errors
+            if (acceptor_.is_open()) {
+                auto timer = std::make_shared<net::steady_timer>(ioc_);
+                timer->expires_after(std::chrono::seconds(1));
+                timer->async_wait([self = shared_from_this(), timer](beast::error_code ec_timer) {
+                    if (!ec_timer) {
+                        self->do_accept();
+                    }
+                });
+                return;
+            }
         } else {
             std::string remote_ip;
             try {

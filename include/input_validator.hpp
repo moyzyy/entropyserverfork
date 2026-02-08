@@ -25,6 +25,11 @@ public:
         if (!pkey) return false;
 
         EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+        if (!ctx) {
+            EVP_PKEY_free(pkey);
+            return false;
+        }
+        
         bool result = false;
 
         if (EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1) {
@@ -50,7 +55,9 @@ public:
     
     // Checks for a valid SHA256 hex hash (64 characters).
     static bool is_valid_hash(const std::string& hash) {
-        return is_valid_hex(hash, 64);
+        // Support both standard 32-byte hashes (64-char hex) 
+        // and 33-byte Signal identity keys (66-char hex starting with 05).
+        return is_valid_hex(hash, 64) || is_valid_hex(hash, 66);
     }
     
     // Checks for safe alphanumeric characters (including underscores and hyphens).
@@ -92,6 +99,31 @@ public:
         boost::json::parse_options opt;
         opt.max_depth = 16; 
         return boost::json::parse(input, {}, opt);
+    }
+
+    // Decodes URL-encoded strings (e.g., %20 to space).
+    static std::string url_decode(const std::string& str) {
+        std::string result;
+        result.reserve(str.length());
+        
+        for (size_t i = 0; i < str.length(); ++i) {
+            if (str[i] == '%' && i + 2 < str.length()) {
+                int hex_val = 0;
+                std::stringstream ss;
+                ss << std::hex << str.substr(i + 1, 2);
+                if (ss >> hex_val) {
+                    result += static_cast<char>(hex_val);
+                    i += 2;
+                } else {
+                    result += '%';
+                }
+            } else if (str[i] == '+') {
+                result += ' ';
+            } else {
+                result += str[i];
+            }
+        }
+        return result;
     }
 };
 

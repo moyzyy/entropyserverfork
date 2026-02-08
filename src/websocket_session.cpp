@@ -121,7 +121,15 @@ void WebSocketSession::accept(
     std::function<void(beast::error_code)> on_accept
 ) {
     auto self = shared_from_this();
-    auto handler = [self, on_accept](beast::error_code ec) {
+    
+    // Transfer any leftover bytes to our own read buffer
+    read_buffer_ = std::move(buffer);
+
+    auto req_ptr = std::make_shared<http::request<Body, http::basic_fields<Allocator>>>(std::move(req));
+    auto handler = [self, on_accept, req_ptr](beast::error_code ec) {
+        if (ec) {
+            std::cerr << "[!] WebSocket async_accept error: " << ec.message() << "\n";
+        }
         if (on_accept) {
             on_accept(ec);
         }
@@ -129,10 +137,10 @@ void WebSocketSession::accept(
     
     if (is_tls_) {
         auto& ws = std::get<websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(ws_);
-        ws.async_accept(req, handler);
+        ws.async_accept(*req_ptr, handler);
     } else {
         auto& ws = std::get<websocket::stream<beast::tcp_stream>>(ws_);
-        ws.async_accept(req, handler);
+        ws.async_accept(*req_ptr, handler);
     }
 }
 

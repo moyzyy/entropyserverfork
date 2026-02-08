@@ -100,7 +100,7 @@ http::response<http::string_body> IdentityHandler::handle_keys_upload(const http
         res.body() = json::serialize(error);
         res.prepare_payload();
         add_security_headers(res);
-        add_cors_headers(res);
+        add_cors_headers(res, &req);
         return res;
     }
 
@@ -120,7 +120,7 @@ http::response<http::string_body> IdentityHandler::handle_keys_upload(const http
                 res.body() = json::serialize(error);
                 res.prepare_payload();
                 add_security_headers(res);
-                add_cors_headers(res);
+                add_cors_headers(res, &req);
                 return res;
             }
         }
@@ -139,7 +139,7 @@ http::response<http::string_body> IdentityHandler::handle_keys_upload(const http
              res.body() = json::serialize(error);
              res.prepare_payload();
              add_security_headers(res);
-             add_cors_headers(res);
+             add_cors_headers(res, &req);
              return res;
         }
         
@@ -151,7 +151,7 @@ http::response<http::string_body> IdentityHandler::handle_keys_upload(const http
              res.body() = json::serialize(error);
              res.prepare_payload();
              add_security_headers(res);
-             add_cors_headers(res);
+             add_cors_headers(res, &req);
              return res;
         }
 
@@ -175,7 +175,7 @@ http::response<http::string_body> IdentityHandler::handle_keys_upload(const http
              res.body() = json::serialize(error);
              res.prepare_payload();
              add_security_headers(res);
-             add_cors_headers(res);
+             add_cors_headers(res, &req);
              return res;
         }
 
@@ -206,50 +206,40 @@ http::response<http::string_body> IdentityHandler::handle_keys_upload(const http
                     res.body() = json::serialize(error);
                     res.prepare_payload();
                     add_security_headers(res);
-                    add_cors_headers(res);
+                    add_cors_headers(res, &req);
                     return res;
                 }
 
-                // Verify self-signed bundle signature if provided
-                if (!obj.contains("bundle_signature") || !obj["bundle_signature"].is_string()) {
-                    json::object error;
-                    error["error"] = "Bundle signature required for cryptographic ownership";
-                    http::response<http::string_body> res{http::status::unauthorized, req.version()};
-                    res.set(http::field::content_type, "application/json");
-                    res.body() = json::serialize(error);
-                    res.prepare_payload();
-                    add_security_headers(res);
-                    add_cors_headers(res);
-                    return res;
-                }
+                // Verify self-signed bundle signature if provided (Zero-Knowledge Ownership)
+                if (obj.contains("bundle_signature") && obj["bundle_signature"].is_string()) {
+                    std::string sig_b64 = std::string(obj["bundle_signature"].as_string());
+                    std::vector<unsigned char> decoded_sig;
+                    decoded_sig.resize(boost::beast::detail::base64::decoded_size(sig_b64.size()));
+                    auto sig_res = boost::beast::detail::base64::decode(decoded_sig.data(), sig_b64.c_str(), sig_b64.size());
+                    decoded_sig.resize(sig_res.first);
+     
+                    json::object sign_obj;
+                    sign_obj["identityKey"] = obj["identityKey"];
+                    sign_obj["pq_identityKey"] = obj["pq_identityKey"];
+                    sign_obj["signedPreKey"] = obj["signedPreKey"];
+                    sign_obj["preKeys"] = obj["preKeys"];
+                    
+                    std::string sign_data = json::serialize(sign_obj);
+                    std::vector<unsigned char> msg_vec(sign_data.begin(), sign_data.end());
 
-                std::string sig_b64 = std::string(obj["bundle_signature"].as_string());
-                std::vector<unsigned char> decoded_sig;
-                decoded_sig.resize(boost::beast::detail::base64::decoded_size(sig_b64.size()));
-                auto sig_res = boost::beast::detail::base64::decode(decoded_sig.data(), sig_b64.c_str(), sig_b64.size());
-                decoded_sig.resize(sig_res.first);
- 
-                json::object sign_obj;
-                sign_obj["identityKey"] = obj["identityKey"];
-                sign_obj["pq_identityKey"] = obj["pq_identityKey"];
-                sign_obj["signedPreKey"] = obj["signedPreKey"];
-                sign_obj["preKeys"] = obj["preKeys"];
-                
-                std::string sign_data = json::serialize(sign_obj);
-                std::vector<unsigned char> msg_vec(sign_data.begin(), sign_data.end());
-
-                if (!InputValidator::verify_ed25519(decoded_key, msg_vec, decoded_sig)) {
-                    SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::AUTH_FAILURE,
-                                      remote_addr, "Keys upload: Invalid bundle signature");
-                    json::object error;
-                    error["error"] = "Invalid bundle signature";
-                    http::response<http::string_body> res{http::status::forbidden, req.version()};
-                    res.set(http::field::content_type, "application/json");
-                    res.body() = json::serialize(error);
-                    res.prepare_payload();
-                    add_security_headers(res);
-                    add_cors_headers(res);
-                    return res;
+                    if (!InputValidator::verify_ed25519(decoded_key, msg_vec, decoded_sig)) {
+                        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::AUTH_FAILURE,
+                                          remote_addr, "Keys upload: Invalid bundle signature");
+                        json::object error;
+                        error["error"] = "Invalid bundle signature";
+                        http::response<http::string_body> res{http::status::forbidden, req.version()};
+                        res.set(http::field::content_type, "application/json");
+                        res.body() = json::serialize(error);
+                        res.prepare_payload();
+                        add_security_headers(res);
+                        add_cors_headers(res, &req);
+                        return res;
+                    }
                 }
             }
         }
@@ -262,7 +252,7 @@ http::response<http::string_body> IdentityHandler::handle_keys_upload(const http
              res.body() = json::serialize(error);
              res.prepare_payload();
              add_security_headers(res);
-             add_cors_headers(res);
+             add_cors_headers(res, &req);
              return res;
         }
         
@@ -275,10 +265,10 @@ http::response<http::string_body> IdentityHandler::handle_keys_upload(const http
         res.prepare_payload();
         
         add_security_headers(res);
-        add_cors_headers(res);
+        add_cors_headers(res, &req);
         return res;
         
-    } catch (...) {
+    } catch (const std::exception& e) {
         json::object error;
         error["error"] = "Invalid JSON";
         
@@ -287,7 +277,7 @@ http::response<http::string_body> IdentityHandler::handle_keys_upload(const http
         res.body() = json::serialize(error);
         res.prepare_payload();
         add_security_headers(res);
-        add_cors_headers(res);
+        add_cors_headers(res, &req);
         return res;
     }
 }
@@ -302,7 +292,11 @@ http::response<http::string_body> IdentityHandler::handle_keys_fetch(const http:
         users_param = std::string(target.substr(user_pos + 5));
         size_t amp_pos = users_param.find('&');
         if (amp_pos != std::string::npos) users_param = users_param.substr(0, amp_pos);
+        users_param = InputValidator::url_decode(users_param);
     }
+
+    SecurityLogger::log(SecurityLogger::Level::INFO, SecurityLogger::EventType::AUTH_SUCCESS,
+                       remote_addr, "Key fetch request for: " + users_param);
 
     std::vector<std::string> user_hashes;
     std::stringstream ss(users_param);
@@ -315,6 +309,8 @@ http::response<http::string_body> IdentityHandler::handle_keys_fetch(const http:
 
     if (user_hashes.empty()) {
         http::response<http::string_body> res{http::status::bad_request, req.version()};
+        add_security_headers(res);
+        add_cors_headers(res, &req);
         res.prepare_payload();
         return res;
     }
@@ -326,16 +322,23 @@ http::response<http::string_body> IdentityHandler::handle_keys_fetch(const http:
     if (user_hashes.size() == 1) {
         std::string bundle = key_storage_.get_bundle(user_hashes[0]);
         if (bundle.empty()) {
+            SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::INVALID_INPUT,
+                               remote_addr, "Key bundle NOT FOUND for: " + user_hashes[0]);
             http::response<http::string_body> res{http::status::not_found, req.version()};
+            add_security_headers(res);
+            add_cors_headers(res, &req);
             res.prepare_payload();
             return res;
         }
+
+        SecurityLogger::log(SecurityLogger::Level::INFO, SecurityLogger::EventType::AUTH_SUCCESS,
+                           remote_addr, "Key bundle retrieved for: " + user_hashes[0] + " (Size: " + std::to_string(bundle.size()) + ")");
         http::response<http::string_body> res{http::status::ok, req.version()};
         res.set(http::field::content_type, "application/json");
         res.body() = bundle;
         res.prepare_payload();
         add_security_headers(res);
-        add_cors_headers(res);
+        add_cors_headers(res, &req);
         return res;
     } else {
         // Multi-user batch fetch
@@ -353,7 +356,7 @@ http::response<http::string_body> IdentityHandler::handle_keys_fetch(const http:
         res.body() = json::serialize(results);
         res.prepare_payload();
         add_security_headers(res);
-        add_cors_headers(res);
+        add_cors_headers(res, &req);
         return res;
     }
 }
@@ -367,7 +370,7 @@ http::response<http::string_body> IdentityHandler::handle_keys_random(const http
         res.body() = json::serialize(error);
         res.prepare_payload();
         add_security_headers(res);
-        add_cors_headers(res);
+        add_cors_headers(res, &req);
         return res;
     }
 
@@ -399,7 +402,7 @@ http::response<http::string_body> IdentityHandler::handle_keys_random(const http
     res.body() = json::serialize(response);
     res.prepare_payload();
     add_security_headers(res);
-    add_cors_headers(res);
+    add_cors_headers(res, &req);
     return res;
 }
 
@@ -427,7 +430,7 @@ http::response<http::string_body> IdentityHandler::handle_nickname_register(cons
             res.body() = json::serialize(error);
             res.prepare_payload();
             add_security_headers(res);
-            add_cors_headers(res);
+            add_cors_headers(res, &req);
             return res;
         }
 
@@ -439,7 +442,7 @@ http::response<http::string_body> IdentityHandler::handle_nickname_register(cons
              res.body() = json::serialize(error);
              res.prepare_payload();
              add_security_headers(res);
-             add_cors_headers(res);
+             add_cors_headers(res, &req);
              return res;
         }
 
@@ -462,9 +465,12 @@ http::response<http::string_body> IdentityHandler::handle_nickname_register(cons
              res.body() = json::serialize(error);
              res.prepare_payload();
              add_security_headers(res);
-             add_cors_headers(res);
+             add_cors_headers(res, &req);
              return res;
         }
+
+        SecurityLogger::log(SecurityLogger::Level::INFO, SecurityLogger::EventType::AUTH_SUCCESS,
+                           remote_addr, "Registering nickname: " + nickname + " for hash: " + user_hash);
 
         if (redis_.register_nickname(nickname, user_hash)) {
             json::object response;
@@ -475,7 +481,7 @@ http::response<http::string_body> IdentityHandler::handle_nickname_register(cons
             res.body() = json::serialize(response);
             res.prepare_payload();
             add_security_headers(res);
-            add_cors_headers(res);
+            add_cors_headers(res, &req);
             return res;
         } else {
             json::object error;
@@ -485,7 +491,7 @@ http::response<http::string_body> IdentityHandler::handle_nickname_register(cons
             res.body() = json::serialize(error);
             res.prepare_payload();
             add_security_headers(res);
-            add_cors_headers(res);
+            add_cors_headers(res, &req);
             return res;
         }
 
@@ -497,7 +503,7 @@ http::response<http::string_body> IdentityHandler::handle_nickname_register(cons
         res.body() = json::serialize(error);
         res.prepare_payload();
         add_security_headers(res);
-        add_cors_headers(res);
+        add_cors_headers(res, &req);
         return res;
     }
 }
@@ -522,8 +528,15 @@ http::response<http::string_body> IdentityHandler::handle_nickname_lookup(const 
         }
     }
 
+    SecurityLogger::log(SecurityLogger::Level::INFO, SecurityLogger::EventType::AUTH_SUCCESS,
+                       remote_addr, "Nickname lookup requested for: " + names_param);
+
+    names_param = InputValidator::url_decode(names_param);
+
     if (nicknames.empty()) {
         http::response<http::string_body> res{http::status::bad_request, req.version()};
+        add_security_headers(res);
+        add_cors_headers(res, &req);
         res.prepare_payload();
         return res;
     }
@@ -533,10 +546,21 @@ http::response<http::string_body> IdentityHandler::handle_nickname_lookup(const 
     if (nicknames.size() == 1) {
         std::string user_hash = redis_.resolve_nickname(nicknames[0]);
         if (user_hash.empty()) {
-            http::response<http::string_body> res{http::status::not_found, req.version()};
-            res.prepare_payload();
-            return res;
+            // Fallback: If not found as nickname, check if it's already a valid hash
+            if (InputValidator::is_valid_hash(nicknames[0])) {
+                user_hash = nicknames[0];
+            } else {
+                SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::INVALID_INPUT,
+                                   remote_addr, "Nickname not found in Redis: " + nicknames[0]);
+                http::response<http::string_body> res{http::status::not_found, req.version()};
+                add_security_headers(res);
+                add_cors_headers(res, &req);
+                res.prepare_payload();
+                return res;
+            }
         }
+        SecurityLogger::log(SecurityLogger::Level::INFO, SecurityLogger::EventType::AUTH_SUCCESS,
+                           remote_addr, "Nickname resolved: " + nicknames[0] + " -> " + user_hash);
         json::object response;
         response["identity_hash"] = user_hash;
         response["nickname"] = nicknames[0];
@@ -545,7 +569,7 @@ http::response<http::string_body> IdentityHandler::handle_nickname_lookup(const 
         res.body() = json::serialize(response);
         res.prepare_payload();
         add_security_headers(res);
-        add_cors_headers(res);
+        add_cors_headers(res, &req);
         return res;
     } else {
         json::object results;
@@ -558,7 +582,7 @@ http::response<http::string_body> IdentityHandler::handle_nickname_lookup(const 
         res.body() = json::serialize(results);
         res.prepare_payload();
         add_security_headers(res);
-        add_cors_headers(res);
+        add_cors_headers(res, &req);
         return res;
     }
 }
@@ -579,7 +603,10 @@ http::response<http::string_body> IdentityHandler::handle_pow_challenge(const ht
         std::string id_hash = std::string(target.substr(hash_pos + 14));
         size_t amp_pos = id_hash.find('&');
         if (amp_pos != std::string::npos) id_hash = id_hash.substr(0, amp_pos);
-        if (!id_hash.empty()) age = redis_.get_account_age(id_hash);
+        if (!id_hash.empty()) {
+            id_hash = InputValidator::url_decode(id_hash);
+            age = redis_.get_account_age(id_hash);
+        }
     }
 
     int difficulty = PoWVerifier::get_required_difficulty(intensity_penalty, age);
@@ -589,7 +616,10 @@ http::response<http::string_body> IdentityHandler::handle_pow_challenge(const ht
         std::string nick = std::string(target.substr(nick_pos + 9));
         size_t amp_pos = nick.find('&');
         if (amp_pos != std::string::npos) nick = nick.substr(0, amp_pos);
-        if (!nick.empty()) difficulty = PoWVerifier::get_difficulty_for_nickname(nick, intensity_penalty, age);
+        if (!nick.empty()) {
+            nick = InputValidator::url_decode(nick);
+            difficulty = PoWVerifier::get_difficulty_for_nickname(nick, intensity_penalty, age);
+        }
     }
     
     json::object response;
@@ -602,7 +632,7 @@ http::response<http::string_body> IdentityHandler::handle_pow_challenge(const ht
     res.prepare_payload();
     
     add_security_headers(res);
-    add_cors_headers(res);
+    add_cors_headers(res, &req);
     
     return res;
 }
@@ -627,7 +657,7 @@ http::response<http::string_body> IdentityHandler::handle_account_burn(const htt
             res.body() = json::serialize(error);
             res.prepare_payload();
             add_security_headers(res);
-            add_cors_headers(res);
+            add_cors_headers(res, &req);
             return res;
         }
 
@@ -649,7 +679,7 @@ http::response<http::string_body> IdentityHandler::handle_account_burn(const htt
                     http::response<http::string_body> res{http::status::forbidden, req.version()};
                     res.prepare_payload();
                     add_security_headers(res);
-                    add_cors_headers(res);
+                    add_cors_headers(res, &req);
                     return res;
                 }
 
@@ -682,7 +712,7 @@ http::response<http::string_body> IdentityHandler::handle_account_burn(const htt
             res.body() = json::serialize(ok);
             res.prepare_payload();
             add_security_headers(res);
-            add_cors_headers(res);
+            add_cors_headers(res, &req);
             return res;
         }
 
@@ -697,13 +727,13 @@ http::response<http::string_body> IdentityHandler::handle_account_burn(const htt
         res.body() = json::serialize(error);
         res.prepare_payload();
         add_security_headers(res);
-        add_cors_headers(res);
+        add_cors_headers(res, &req);
         return res;
     } catch (...) {
         http::response<http::string_body> res{http::status::bad_request, req.version()};
         res.prepare_payload();
         add_security_headers(res);
-        add_cors_headers(res);
+        add_cors_headers(res, &req);
         return res;
     }
 }

@@ -42,7 +42,8 @@ public:
 
     void relay_volatile(const std::string& recipient_hash,
                         const void* data,
-                        size_t length);
+                        size_t length,
+                        std::shared_ptr<WebSocketSession> sender = nullptr);
 
     void relay_multicast(const std::vector<std::string>& recipients,
                          const std::string& message_json);

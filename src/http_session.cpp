@@ -684,7 +684,7 @@ void HttpSession::upgrade_to_websocket() {
             bool is_binary
         ) {
             auto b_ip = conn_mgr_ptr->blind_id(session->remote_address());
-            int max_msgs = session->is_authenticated() ? 200 : 50;
+            int max_msgs = session->is_authenticated() ? 1000 : 50;
             auto limit_res = rate_limiter_ptr->check("ws_msg:" + b_ip, max_msgs, 10);
             if (!limit_res.allowed) {
                 SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::RATE_LIMIT_HIT,
@@ -844,8 +844,6 @@ void HttpSession::upgrade_to_websocket() {
                         
                         response["keys_missing"] = key_storage_ptr->get_bundle(hash).empty();
                         
-                        response["keys_missing"] = key_storage_ptr->get_bundle(hash).empty();
-                        
                         TrafficNormalizer::pad_json(response, 1536);
                         session->send_text(json::serialize(response));
                         
@@ -929,8 +927,77 @@ void HttpSession::upgrade_to_websocket() {
                         std::string to = std::string(obj["to"].as_string());
                         std::string body = std::string(obj["body"].as_string());
                         
-                        relay_ptr->relay_volatile(to, body.data(), body.size());
+                        relay_ptr->relay_volatile(to, body.data(), body.size(), session);
                     }
+                    return;
+                }
+
+                // --- Multiplexed Request Handlers (for single-socket efficiency) ---
+                
+                if (type == "fetch_key") {
+                    if (obj.contains("target_hash")) {
+                        std::string target = std::string(obj["target_hash"].as_string());
+                        std::string req_id = obj.contains("req_id") ? std::string(obj["req_id"].as_string()) : "";
+                        
+                        json::object response;
+                        response["type"] = "key_response";
+                        response["req_id"] = req_id;
+                        response["target_hash"] = target;
+                        
+                        // Enforce Rate Limit for fetches
+                        auto b_ip = conn_mgr_ptr->blind_id(session->remote_address());
+                        auto limit_res = rate_limiter_ptr->check("fetch:" + b_ip, 200, 60); // 200/min
+                        if (!limit_res.allowed) {
+                            response["error"] = "Rate limit exceeded";
+                            session->send_text(json::serialize(response));
+                            return;
+                        }
+
+                        std::string bundle = key_storage_ptr->get_bundle(target);
+                        if (bundle.empty()) {
+                            response["found"] = false;
+                        } else {
+                            response["found"] = true;
+                            try {
+                                response["bundle"] = json::parse(bundle);
+                            } catch(...) { response["found"] = false; }
+                        }
+                        
+                        TrafficNormalizer::pad_json(response, 1024);
+                        session->send_text(json::serialize(response));
+                    }
+                    return;
+                }
+
+                if (type == "fetch_key_random") {
+                    std::string req_id = obj.contains("req_id") ? std::string(obj["req_id"].as_string()) : "";
+                    int count = 5;
+                    if (obj.contains("count") && obj["count"].is_int64()) count = (int)obj["count"].as_int64();
+                    if (count > 20) count = 20;
+
+                    // Enforce Rate Limit for random fetches
+                    auto b_ip = conn_mgr_ptr->blind_id(session->remote_address());
+                    auto limit_res = rate_limiter_ptr->check("keys_rand:" + b_ip, 50, 60);
+                    if (!limit_res.allowed) {
+                         json::object response;
+                         response["type"] = "key_random_response";
+                         response["req_id"] = req_id;
+                         response["error"] = "Rate limit exceeded";
+                         session->send_text(json::serialize(response));
+                         return;
+                    }
+
+                    auto hashes = redis_ptr->get_random_user_hashes(count);
+                    json::array hash_arr;
+                    for(const auto& h : hashes) hash_arr.push_back(json::value(h));
+
+                    json::object response;
+                    response["type"] = "key_random_response";
+                    response["req_id"] = req_id;
+                    response["hashes"] = hash_arr;
+                    
+                    TrafficNormalizer::pad_json(response, 1024);
+                    session->send_text(json::serialize(response));
                     return;
                 }
 
