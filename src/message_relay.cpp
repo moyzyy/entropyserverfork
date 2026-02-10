@@ -32,34 +32,34 @@ MessageRelay::MessageRelay(ConnectionManager& conn_manager, RedisManager& redis,
 
 
 
-// Quickly extracts message metadata without full payload deserialization where possible.
-MessageRelay::RoutingInfo MessageRelay::extract_routing(const std::string& message_json) {
-    RoutingInfo info{.type = "", .to = "", .valid = false};
-    
-    try {
-        auto json_val = InputValidator::safe_parse_json(message_json);
-        if (!json_val.is_object()) {
-            return info;
-        }
+    /**
+     * Extracts routing metadata (type, destination) from a JSON payload.
+     * Performs sanitization and structural validation before higher-level processing.
+     */
+    MessageRelay::RoutingInfo MessageRelay::extract_routing(const std::string& message_json) {
+        RoutingInfo info{.type = "", .to = "", .valid = false};
         
-        auto& obj = json_val.as_object();
-        
-        if (obj.contains("type") && (obj["type"].is_string() || obj["type"].is_number())) {
-            if (obj["type"].is_string()) {
-                info.type = InputValidator::sanitize_field(std::string(obj["type"].as_string()), 64);
-            } else {
-                info.type = std::to_string(obj["type"].as_int64());
+        try {
+            auto json_val = InputValidator::safe_parse_json(message_json);
+            if (!json_val.is_object()) return info;
+            auto& obj = json_val.as_object();
+            
+            if (obj.contains("type") && (obj["type"].is_string() || obj["type"].is_number())) {
+                if (obj["type"].is_string()) {
+                    info.type = InputValidator::sanitize_field(std::string(obj["type"].as_string()), 64);
+                } else {
+                    info.type = std::to_string(obj["type"].as_int64());
+                }
             }
-        }
-        if (obj.contains("to") && obj["to"].is_string()) {
-            info.to = InputValidator::sanitize_field(std::string(obj["to"].as_string()), 256);
-        }
+            if (obj.contains("to") && obj["to"].is_string()) {
+                info.to = InputValidator::sanitize_field(std::string(obj["to"].as_string()), 256);
+            }
 
-        info.valid = !info.type.empty();
-    } catch (...) {}
-    
-    return info;
-}
+            info.valid = !info.type.empty();
+        } catch (...) {}
+        
+        return info;
+    }
 
 // Core routing logic. Routes messages to local sessions or pushes to Redis for remote instances.
 void MessageRelay::relay_message(const std::string& message_json, 
@@ -77,68 +77,55 @@ void MessageRelay::relay_message(const std::string& message_json,
         return;
     }
 
-    // Handle heartbeats and dummy packets for traffic normalization
-    if (routing.type == "ping" || routing.type == "dummy" || routing.type == "dummy_pacing") {
-        handle_dummy(sender);
-        return;
-    }
-    
-    try {
-        auto json_val = InputValidator::safe_parse_json(message_json);
-        if (!json_val.is_object()) return;
-        auto& obj = json_val.as_object();
-        
-        // Strip non-essential fields to normalize the message body, but preserve protocol fields
-        json::object clean_msg;
-        if (obj.contains("type")) clean_msg["type"] = obj["type"];
-        
-        // Protocol-specific field preservation
-        if (obj.contains("fragmentId")) clean_msg["fragmentId"] = obj["fragmentId"];
-        if (obj.contains("index")) clean_msg["index"] = obj["index"];
-        if (obj.contains("total")) clean_msg["total"] = obj["total"];
-        if (obj.contains("data")) clean_msg["data"] = obj["data"];
-        if (obj.contains("bundle")) clean_msg["bundle"] = obj["bundle"];
-        if (obj.contains("body")) clean_msg["body"] = obj["body"];
-        if (obj.contains("content")) clean_msg["content"] = obj["content"];
-        if (obj.contains("id")) clean_msg["id"] = obj["id"];
-        if (obj.contains("pow")) clean_msg["pow"] = obj["pow"];
-        
-        // Encrypted Envelope Fields - CRITICAL FIX
-        if (obj.contains("payload")) clean_msg["payload"] = obj["payload"];
-        if (obj.contains("pq_ciphertext")) clean_msg["pq_ciphertext"] = obj["pq_ciphertext"];
-        if (obj.contains("sender_identity_key")) clean_msg["sender_identity_key"] = obj["sender_identity_key"];
-        if (obj.contains("ephemeral_key")) clean_msg["ephemeral_key"] = obj["ephemeral_key"];
-        if (obj.contains("target_hash")) clean_msg["target_hash"] = obj["target_hash"];
-        
-        // Ensure the sender identity is preserved for the receiver
-        clean_msg["sender"] = sender->get_user_data();
-        
-        std::string final_json = json::serialize(clean_msg);
-        
-        // Ensure the message reaches the minimum threshold for packet padding
-        if (final_json.size() < REQUIRED_PACKET_SIZE) {
-             json::object padded_obj = clean_msg;
-             TrafficNormalizer::pad_json(padded_obj, REQUIRED_PACKET_SIZE);
-             final_json = json::serialize(padded_obj);
+        if (routing.type == "ping" || routing.type == "dummy" || routing.type == "dummy_pacing") {
+            handle_dummy(sender);
+            return;
         }
-
-        // Random jitter to mitigate timing analysis attacks
-        thread_local std::mt19937 gen{std::random_device{}()};
-        std::uniform_int_distribution<> dis(10, 50); 
         
-        if (!routing.to.empty()) {
+        try {
+            auto json_val = InputValidator::safe_parse_json(message_json);
+            if (!json_val.is_object()) return;
+            auto& obj = json_val.as_object();
             
-            // Apply recipient-side flood protection
-            auto rcv_limit = rate_limiter_.check("rcv:" + routing.to, 1000, 10); 
-            if (!rcv_limit.allowed) {
-                MetricsRegistry::instance().increment_counter("recipient_flood_blocked");
-                return; 
+            json::object clean_msg;
+            if (obj.contains("type")) clean_msg["type"] = obj["type"];
+            if (obj.contains("fragmentId")) clean_msg["fragmentId"] = obj["fragmentId"];
+            if (obj.contains("index")) clean_msg["index"] = obj["index"];
+            if (obj.contains("total")) clean_msg["total"] = obj["total"];
+            if (obj.contains("data")) clean_msg["data"] = obj["data"];
+            if (obj.contains("bundle")) clean_msg["bundle"] = obj["bundle"];
+            if (obj.contains("body")) clean_msg["body"] = obj["body"];
+            if (obj.contains("content")) clean_msg["content"] = obj["content"];
+            if (obj.contains("id")) clean_msg["id"] = obj["id"];
+            if (obj.contains("pow")) clean_msg["pow"] = obj["pow"];
+            if (obj.contains("payload")) clean_msg["payload"] = obj["payload"];
+            if (obj.contains("pq_ciphertext")) clean_msg["pq_ciphertext"] = obj["pq_ciphertext"];
+            if (obj.contains("sender_identity_key")) clean_msg["sender_identity_key"] = obj["sender_identity_key"];
+            if (obj.contains("ephemeral_key")) clean_msg["ephemeral_key"] = obj["ephemeral_key"];
+            if (obj.contains("target_hash")) clean_msg["target_hash"] = obj["target_hash"];
+            
+            clean_msg["sender"] = sender->get_user_data();
+            std::string final_json = json::serialize(clean_msg);
+            
+            if (final_json.size() < REQUIRED_PACKET_SIZE) {
+                 json::object padded_obj = clean_msg;
+                 TrafficNormalizer::pad_json(padded_obj, REQUIRED_PACKET_SIZE);
+                 final_json = json::serialize(padded_obj);
             }
 
-            auto recipient = conn_manager_.get_connection(routing.to);
-            if (recipient) {
-                // Determine if this is a media fragment to trigger faster pacing
-                bool is_media = (clean_msg.contains("type") && clean_msg["type"] == "msg_fragment");
+            thread_local std::mt19937 gen{std::random_device{}()};
+            std::uniform_int_distribution<> dis(10, 50); 
+            
+            if (!routing.to.empty()) {
+                auto rcv_limit = rate_limiter_.check("rcv:" + routing.to, 1000, 10); 
+                if (!rcv_limit.allowed) {
+                    MetricsRegistry::instance().increment_counter("recipient_flood_blocked");
+                    return; 
+                }
+
+                auto recipient = conn_manager_.get_connection(routing.to);
+                if (recipient) {
+                    bool is_media = (clean_msg.contains("type") && clean_msg["type"] == "msg_fragment");
                 
                 // Local delivery (async with jitter)
                 auto timer = std::make_shared<boost::asio::steady_timer>(recipient->get_executor());

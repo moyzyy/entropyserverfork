@@ -19,17 +19,20 @@ namespace json = boost::json;
 namespace entropy {
 
 
-WebSocketSession::WebSocketSession(
-    beast::ssl_stream<beast::tcp_stream>&& stream,
-    ConnectionManager& conn_manager,
-    const ServerConfig& config
-)
+    /**
+     * WebSocketSession Constructor (TLS Transport).
+     * Configures the secure stream with optimized timeouts, keep-alive pacing, and compression.
+     */
+    WebSocketSession::WebSocketSession(
+        beast::ssl_stream<beast::tcp_stream>&& stream,
+        ConnectionManager& conn_manager,
+        const ServerConfig& config
+    )
     : ws_(websocket::stream<beast::ssl_stream<beast::tcp_stream>>(std::move(stream)))
     , is_tls_(true)
     , conn_manager_(conn_manager)
     , config_(config)
 {
-    // Extract remote address for logging and rate limiting
     try {
         auto& tls_ws = std::get<websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(ws_);
         auto ep = beast::get_lowest_layer(tls_ws).socket().remote_endpoint();
@@ -40,17 +43,14 @@ WebSocketSession::WebSocketSession(
     
     auto& tls_ws = std::get<websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(ws_);
     
-    // Configure session timeouts and keep-alive behavior
     websocket::stream_base::timeout opt{};
     opt.handshake_timeout = std::chrono::seconds(15);
-    opt.idle_timeout = std::chrono::seconds(300); // 5 minute idle window 
+    opt.idle_timeout = std::chrono::seconds(300);
     opt.keep_alive_pings = true;                   
     tls_ws.set_option(opt);
     
-    // Disable underlying socket-level timeout to let WebSocket layer handle it
     beast::get_lowest_layer(tls_ws).expires_never();
     
-    // Enable per-message compression for bandwidth efficiency
     websocket::permessage_deflate pmd;
     pmd.server_enable = true;
     pmd.client_enable = true;
@@ -113,7 +113,6 @@ net::any_io_executor WebSocketSession::get_executor() {
     }
 }
 
-// Perform the WebSocket Upgrade handshake
 template<class Body, class Allocator>
 void WebSocketSession::accept(
     http::request<Body, http::basic_fields<Allocator>>&& req,
@@ -121,18 +120,12 @@ void WebSocketSession::accept(
     std::function<void(beast::error_code)> on_accept
 ) {
     auto self = shared_from_this();
-    
-    // Transfer any leftover bytes to our own read buffer
     read_buffer_ = std::move(buffer);
 
     auto req_ptr = std::make_shared<http::request<Body, http::basic_fields<Allocator>>>(std::move(req));
     auto handler = [self, on_accept, req_ptr](beast::error_code ec) {
-        if (ec) {
-            std::cerr << "[!] WebSocket async_accept error: " << ec.message() << "\n";
-        }
-        if (on_accept) {
-            on_accept(ec);
-        }
+        if (ec) std::cerr << "[!] WebSocket async_accept error: " << ec.message() << "\n";
+        if (on_accept) on_accept(ec);
     };
     
     if (is_tls_) {
@@ -333,51 +326,46 @@ void WebSocketSession::do_close() {
     }
 }
 
-// Initiates the periodic Pacing loop for traffic normalization.
-void WebSocketSession::start_pacing() {
-    pacing_timer_ = std::make_shared<net::steady_timer>(get_executor());
-    tick_pacing();
-}
+    void WebSocketSession::start_pacing() {
+        pacing_timer_ = std::make_shared<net::steady_timer>(get_executor());
+        tick_pacing();
+    }
 
-// Sends dummy packets at regular intervals if no real activity is detected.
-void WebSocketSession::tick_pacing() {
-    if (close_triggered_) return;
-    
-    auto self = shared_from_this();
-    
-    // Stealth Gear (500ms) or Media Gear (10ms)
-    int current_interval = last_was_media_ ? 10 : ServerConfig::Pacing::tick_interval_ms;
-
-    pacing_timer_->expires_after(std::chrono::milliseconds(current_interval));
-    pacing_timer_->async_wait([self, this](beast::error_code ec) {
-        if (ec || close_triggered_) return;
+    /**
+     * Executes the periodic Pacing loop for traffic normalization.
+     * Injects dummy packets when no legitimate traffic is queued to obscure communication metadata.
+     */
+    void WebSocketSession::tick_pacing() {
+        if (close_triggered_) return;
         
-        net::post(get_executor(), [self, this]() {
-            if (close_triggered_) return;
+        auto self = shared_from_this();
+        int current_interval = last_was_media_ ? 10 : ServerConfig::Pacing::tick_interval_ms;
 
-            // If we have nothing to send, and we are authenticated, send a dummy to maintain pulse.
-            // If not authenticated, we only send real messages (like challenges, keys, errors).
-            if (write_queue_.empty()) {
-                if (!is_authenticated()) {
-                    // Stay silent until auth, but keep the heartbeat ready
-                    tick_pacing();
-                    return;
+        pacing_timer_->expires_after(std::chrono::milliseconds(current_interval));
+        pacing_timer_->async_wait([self, this](beast::error_code ec) {
+            if (ec || close_triggered_) return;
+            
+            net::post(get_executor(), [self, this]() {
+                if (close_triggered_) return;
+
+                if (write_queue_.empty()) {
+                    if (!is_authenticated()) {
+                        tick_pacing();
+                        return;
+                    }
+                    
+                    json::object dummy;
+                    dummy["type"] = "dummy_pacing";
+                    TrafficNormalizer::pad_json(dummy, ServerConfig::Pacing::packet_size);
+                    write_queue_.push(QueuedMessage{std::make_shared<std::string>(json::serialize(dummy)), false, false});
+                    last_was_media_ = false;
                 }
                 
-                json::object dummy;
-                dummy["type"] = "dummy_pacing";
-                TrafficNormalizer::pad_json(dummy, ServerConfig::Pacing::packet_size);
-                write_queue_.push(QueuedMessage{std::make_shared<std::string>(json::serialize(dummy)), false, false});
-                last_was_media_ = false;
-            }
-            
-            // Trigger write if not already writing
-            do_write();
-
-            tick_pacing();
+                do_write();
+                tick_pacing();
+            });
         });
-    });
-}
+    }
 
 
 }

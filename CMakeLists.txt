@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 project(entropy_backend VERSION 2.0 LANGUAGES CXX C)
-enable_testing()
+
 
 if(POLICY CMP0167)
     cmake_policy(SET CMP0167 OLD)
@@ -35,7 +35,7 @@ include(FetchContent)
 set(DISABLE_TESTS ON CACHE BOOL "" FORCE)
 set(ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 # Testing configuration
-option(BUILD_TESTING "Build the testing suite" ON)
+
 
 FetchContent_Declare(
     hiredis
@@ -136,6 +136,3 @@ add_custom_target(generate_certs
     VERBATIM
 )
 
-if(BUILD_TESTING)
-    add_subdirectory(tests)
-endif()

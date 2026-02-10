@@ -108,11 +108,14 @@ private:
             });
     }
     
+    /**
+     * Accepts incoming TCP connections and elevates them to HTTP sessions.
+     * Integrates IP-based connection limits and TLS/Plaintext multiplexing.
+     */
     void on_accept(beast::error_code ec, tcp::socket socket) {
         if (ec) {
             SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::CONNECTION_REJECTED, "internal", "Accept error: " + ec.message());
             
-            // If the listener is still open, wait a bit before retrying to avoid spinning on fatal errors
             if (acceptor_.is_open()) {
                 auto timer = std::make_shared<net::steady_timer>(ioc_);
                 timer->expires_after(std::chrono::seconds(1));
@@ -125,26 +128,17 @@ private:
             }
         } else {
             std::string remote_ip;
-            try {
-                remote_ip = socket.remote_endpoint().address().to_string();
-            } catch (...) {
-                remote_ip = "unknown";
-            }
-
-            // Accepted connection from remote peer
+            try { remote_ip = socket.remote_endpoint().address().to_string(); } catch (...) { remote_ip = "unknown"; }
             
             if (conn_manager_.connection_count() >= config_.max_global_connections) {
                 SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::CONNECTION_REJECTED,
                                   remote_ip, "Global connection limit reached");
                 MetricsRegistry::instance().increment_counter("global_limit_rejected");
             } else if (!conn_manager_.increment_ip_count(remote_ip, config_.max_connections_per_ip)) {
-                // Enforce per-IP connection limit BEFORE creating session
                 SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::RATE_LIMIT_HIT,
                                   remote_ip, "Per-IP total connection limit reached");
                 MetricsRegistry::instance().increment_counter("ip_limit_rejected");
-                // Socket will be closed when it goes out of scope here
             } else {
-                // Create a guard to decrement the IP count when the session tree is destroyed
                 auto guard = std::shared_ptr<void>(nullptr, [self_ref = shared_from_this(), remote_ip](void*){
                     self_ref->conn_manager_.decrement_ip_count(remote_ip);
                 });
@@ -218,7 +212,6 @@ int main(int argc, char* argv[]) {
     try {
         entropy::ServerConfig config;
         
-        // --- CLI Argument Parsing ---
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--no-tls" || arg == "-n") {
@@ -238,17 +231,9 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        // --- Environment Variable Overrides ---
-        
-        if (const char* env_port = std::getenv("ENTROPY_PORT")) {
-            config.port = static_cast<uint16_t>(std::stoi(env_port));
-        }
-        if (const char* env_addr = std::getenv("ENTROPY_ADDR")) {
-            config.address = env_addr;
-        }
-        if (const char* env_redis = std::getenv("ENTROPY_REDIS_URL")) {
-            config.redis_url = env_redis;
-        }
+        if (const char* env_port = std::getenv("ENTROPY_PORT")) config.port = static_cast<uint16_t>(std::stoi(env_port));
+        if (const char* env_addr = std::getenv("ENTROPY_ADDR")) config.address = env_addr;
+        if (const char* env_redis = std::getenv("ENTROPY_REDIS_URL")) config.redis_url = env_redis;
         if (const char* env_origins = std::getenv("ENTROPY_ALLOWED_ORIGINS")) {
             config.allowed_origins.clear();
             std::string origins_str(env_origins);
@@ -257,14 +242,10 @@ int main(int argc, char* argv[]) {
                 config.allowed_origins.push_back(origins_str.substr(0, pos));
                 origins_str.erase(0, pos + 1);
             }
-            if (!origins_str.empty()) {
-                config.allowed_origins.push_back(origins_str);
-            }
+            if (!origins_str.empty()) config.allowed_origins.push_back(origins_str);
         }
         
-        if (const char* env_salt = std::getenv("ENTROPY_SECRET_SALT")) {
-            config.secret_salt = env_salt;
-        }
+        if (const char* env_salt = std::getenv("ENTROPY_SECRET_SALT")) config.secret_salt = env_salt;
 
         if (const char* env_admin = std::getenv("ENTROPY_ADMIN_TOKEN")) {
             config.admin_token = env_admin;
@@ -297,7 +278,7 @@ int main(int argc, char* argv[]) {
              SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::INVALID_INPUT, "internal", "No CORS origins configured");
         }
         
-        static const std::string DEFAULT_SALT = "CHANGE_ME_IN_PRODUCTION_VIA_ENV_OR_LOGS_WILL_BE_INSECURE";
+        static const std::string DEFAULT_SALT = "CHANGE_IN_PROD";
         if (config.secret_salt == DEFAULT_SALT) {
             std::cerr << "CRITICAL SECURITY ERROR: DEFAULT SECRET SALT DETECTED\n";
             std::cerr << "Set 'ENTROPY_SECRET_SALT' environment variable immediately!\n";
@@ -390,8 +371,10 @@ ENTROPY SECURE MESSAGING SERVER v2.0
         );
         listener->run();
         
-        // Server started successfully
-        // Captured SIGINT and SIGTERM to perform a clean shutdown
+        /**
+         * Orchestrates a graceful shutdown by closing the listener, terminating the connection manager,
+         * and waiting for current I/O operations to drain.
+         */
         net::signal_set signals(ioc, SIGINT, SIGTERM);
         signals.async_wait(
             [&ioc, &running, &conn_manager, listener, &cleanup_timer](beast::error_code const&, int sig) {

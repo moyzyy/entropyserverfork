@@ -21,7 +21,23 @@ std::string IdentityHandler::blind_ip(const std::string& ip, const std::string& 
     return ss.str();
 }
 
-// Validates the Proof-of-Work (PoW) solution.
+/**
+ * Orchestrates Proof-of-Work (PoW) verification for incoming HTTP requests.
+ * This method performs several checks to ensure the validity and integrity
+ * of the provided PoW solution:
+ * 1. Verifies the presence of required PoW headers (X-PoW-Seed, X-PoW-Nonce).
+ * 2. Validates the format of the PoW seed (64-character hexadecimal string).
+ * 3. Validates the format of the PoW nonce (numeric string, max 32 characters).
+ * 4. Checks if the PoW seed has already been consumed to prevent replay attacks.
+ * 5. Delegates the cryptographic verification of the PoW solution to the PoWVerifier.
+ *
+ * @param req The HTTP request containing PoW headers.
+ * @param rate_limiter The rate limiter instance to consume challenge seeds.
+ * @param remote_addr The IP address of the client for logging purposes.
+ * @param target_difficulty The required difficulty for the PoW solution.
+ * @param context A string representing the context for which the PoW was generated (e.g., user hash).
+ * @return True if the PoW solution is valid and all checks pass, false otherwise.
+ */
 bool IdentityHandler::validate_pow(const http::request<http::string_body>& req, RateLimiter& rate_limiter, const std::string& remote_addr, int target_difficulty, const std::string& context) {
     auto seed_it = req.find("X-PoW-Seed");
     auto nonce_it = req.find("X-PoW-Nonce");
@@ -57,7 +73,7 @@ bool IdentityHandler::validate_pow(const http::request<http::string_body>& req, 
     
     if (!::entropy::PoWVerifier::verify(seed, nonce, context, target_difficulty)) {
         SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::POW_FAILURE,
-                          remote_addr, "PoW verification failed (incorrect solution or difficulty mismatch)");
+                          remote_addr, "PoW verification failed");
         return false;
     }
     
@@ -130,7 +146,6 @@ http::response<http::string_body> IdentityHandler::handle_keys_upload(const http
              user_hash = std::string(obj["identity_hash"].as_string());
         }
 
-        // Validate presence of required cryptographic keys.
         if (!obj.contains("pq_identityKey") || !obj.contains("signedPreKey") || !obj.at("signedPreKey").as_object().contains("pq_publicKey")) {
              json::object error;
              error["error"] = "Post-Quantum Handshake Keys Required";
@@ -282,12 +297,15 @@ http::response<http::string_body> IdentityHandler::handle_keys_upload(const http
     }
 }
 
-http::response<http::string_body> IdentityHandler::handle_keys_fetch(const http::request<http::string_body>& req, const std::string& remote_addr) {
-    std::string target = std::string(req.target());
-    std::string users_param;
-    
-    // Parse 'user' comma-separated list from query parameters
-    size_t user_pos = target.find("user=");
+    /**
+     * Retrieves cryptographic bundles for the specified identities.
+     * Supports both single-identity and batch fetch operations.
+     */
+    http::response<http::string_body> IdentityHandler::handle_keys_fetch(const http::request<http::string_body>& req, const std::string& remote_addr) {
+        std::string target = std::string(req.target());
+        std::string users_param;
+        
+        size_t user_pos = target.find("user=");
     if (user_pos != std::string::npos) {
         users_param = std::string(target.substr(user_pos + 5));
         size_t amp_pos = users_param.find('&');
@@ -445,8 +463,6 @@ http::response<http::string_body> IdentityHandler::handle_nickname_register(cons
              add_cors_headers(res, &req);
              return res;
         }
-
-        // Signature verification skipped for plaintext mode
 
         int intensity_penalty = 0;
         int intensity = redis_.get_registration_intensity();
@@ -637,8 +653,12 @@ http::response<http::string_body> IdentityHandler::handle_pow_challenge(const ht
     return res;
 }
 
-http::response<http::string_body> IdentityHandler::handle_account_burn(const http::request<http::string_body>& req, const std::string& remote_addr) {
-    try {
+    /**
+     * Orchestrates the permanent deletion of an account and all associated metadata.
+     * Requires high-difficulty PoW and valid identity signature to prevent unauthorized purging.
+     */
+    http::response<http::string_body> IdentityHandler::handle_account_burn(const http::request<http::string_body>& req, const std::string& remote_addr) {
+        try {
         auto json_val = InputValidator::safe_parse_json(req.body());
         if (!json_val.is_object()) throw std::runtime_error("Invalid payload");
         auto& obj = json_val.as_object();

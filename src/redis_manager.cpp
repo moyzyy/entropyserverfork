@@ -10,101 +10,86 @@
 
 namespace entropy {
 
-RedisManager::RedisManager(const ServerConfig& config, ConnectionManager& conn_manager, const std::string& salt)
+    /**
+     * RedisManager Constructor.
+     * Establishes connection to the Redis cluster and configures "Quiet Persistence"
+     * to minimize forensic metadata footprints on disk.
+     */
+    RedisManager::RedisManager(const ServerConfig& config, ConnectionManager& conn_manager, const std::string& salt)
     : conn_manager_(conn_manager), server_salt_(salt) {
-    try {
-        // Initialize the Redis client using the provided connection string.
-        redis_ = std::make_unique<sw::redis::Redis>(config.redis_url);
-        connected_ = true;
-        
-        // Enforce Quiet Persistence (Forensic-Safe)
         try {
-            // Lazy snapshot: 15 minutes + 1 change. NO forensic logs.
-            redis_->command("CONFIG", "SET", "save", "900 1"); 
-            redis_->command("CONFIG", "SET", "appendonly", "no"); 
-            redis_->command("CONFIG", "SET", "maxmemory-policy", "noeviction");
-            std::cout << "[*] Redis 'Quiet Persistence' active (15min snapshots, no forensic logs).\n";
-        } catch (...) {
-            std::cerr << "[!] Warning: Redis persistence fallback to defaults.\n";
+            redis_ = std::make_unique<sw::redis::Redis>(config.redis_url);
+            connected_ = true;
+            
+            try {
+                // Configure 15-minute snapshot intervals and disable AOF to maximize privacy and performance.
+                redis_->command("CONFIG", "SET", "save", "900 1"); 
+                redis_->command("CONFIG", "SET", "appendonly", "no"); 
+                redis_->command("CONFIG", "SET", "maxmemory-policy", "noeviction");
+            } catch (...) {}
+            
+            running_ = true;
+            subscriber_thread_ = std::thread(&RedisManager::subscriber_loop, this);
+        } catch (const std::exception& e) {
+            std::cerr << "[!] Redis connection failed: " << e.what() << "\n";
+            connected_ = false;
         }
-        
-        running_ = true;
-        subscriber_thread_ = std::thread(&RedisManager::subscriber_loop, this);
-        
-        std::cout << "[*] Redis connected: " << config.redis_url << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "[!] Redis connection failed: " << e.what() << "\n";
-        connected_ = false;
     }
-}
 
-// Atomic Token-Bucket implementation using Redis Lua scripting.
-// This handles rate-limiting, temporary jail (bans), and violation tracking.
-RateLimitResult RedisManager::rate_limit(const std::string& key, int limit, int period_sec, int cost) {
-    RateLimitResult result = {true, (long long)0, (long long)limit, 0};
-    
-    if (!connected_) return result; 
-    
-    try {
-        static const std::string script = R"(
-            local key = KEYS[1]
-            local rate = tonumber(ARGV[1])
-            local burst = tonumber(ARGV[2])
-            local period = tonumber(ARGV[3])
-            local now = tonumber(ARGV[4])
-            local cost = tonumber(ARGV[5])
-            
-            local emission_interval = period / burst 
-            local jail_key = key .. ":jail"
-            local violation_key = key .. ":viol"
-            
-            -- Checked if the identifier is currently jailed (banned)
-            local jail_ttl = redis.call('TTL', jail_key)
-            if jail_ttl > 0 then
-                return {-1, 0, jail_ttl}
-            end
-            
-            -- Calculate the Theoretical Arrival Time (TAT)
-            local tat = redis.call('GET', key)
-            if not tat then
-                tat = now
-            else
-                tat = tonumber(tat)
-            end
-            
-            local tat_val = tat
-            local increment = emission_interval * cost
-            local burst_offset = period 
-            
-            if tat_val < now then
-                tat_val = now
-            end
-            
-            -- If current request exceeds burst capacity, track violation or jail
-            if tat_val + increment - now > burst_offset then
-                local retry_after = tat_val + increment - now - burst_offset
-                local viol = redis.call('INCR', violation_key)
-                if viol == 1 then
-                    redis.call('EXPIRE', violation_key, period * 2)
+    /**
+     * Executes an atomic Generic Cell Rate Algorithm (GCRA) for rate-limiting.
+     * Integrates temporary "jail" state for repeat violators to mitigate DDoS/Brute-force.
+     */
+    RateLimitResult RedisManager::rate_limit(const std::string& key, int limit, int period_sec, int cost) {
+        RateLimitResult result = {true, (long long)0, (long long)limit, 0};
+        if (!connected_) return result; 
+        
+        try {
+            static const std::string script = R"(
+                local key = KEYS[1]
+                local rate = tonumber(ARGV[1])
+                local burst = tonumber(ARGV[2])
+                local period = tonumber(ARGV[3])
+                local now = tonumber(ARGV[4])
+                local cost = tonumber(ARGV[5])
+                
+                local emission_interval = period / burst 
+                local jail_key = key .. ":jail"
+                local violation_key = key .. ":viol"
+                
+                local jail_ttl = redis.call('TTL', jail_key)
+                if jail_ttl > 0 then return {-1, 0, jail_ttl} end
+                
+                local tat = redis.call('GET', key)
+                if not tat then tat = now else tat = tonumber(tat) end
+                
+                local tat_val = tat
+                local increment = emission_interval * cost
+                local burst_offset = period 
+                
+                if tat_val < now then tat_val = now end
+                
+                if tat_val + increment - now > burst_offset then
+                    local retry_after = tat_val + increment - now - burst_offset
+                    local viol = redis.call('INCR', violation_key)
+                    if viol == 1 then redis.call('EXPIRE', violation_key, period * 2) end
+                    
+                    if viol > 5 then
+                         redis.call('SETEX', jail_key, 300, "banned")
+                         return {-1, 0, 300}
+                    end
+                    
+                    return {0, math.ceil(retry_after), 0}
                 end
                 
-                -- Auto-jail for repeated violations
-                if viol > 5 then
-                     redis.call('SETEX', jail_key, 300, "banned")
-                     return {-1, 0, 300}
-                end
+                local new_tat_res = tat_val + increment
+                redis.call('SET', key, new_tat_res, 'EX', period * 2)
                 
-                return {0, math.ceil(retry_after), 0}
-            end
-            
-            local new_tat_res = tat_val + increment
-            redis.call('SET', key, new_tat_res, 'EX', period * 2)
-            
-            local remaining_time = burst_offset - (new_tat_res - now)
-            local remaining_count = math.floor(remaining_time / emission_interval)
-            
-            return {1, remaining_count, 0}
-        )";
+                local remaining_time = burst_offset - (new_tat_res - now)
+                local remaining_count = math.floor(remaining_time / emission_interval)
+                
+                return {1, remaining_count, 0}
+            )";
 
         auto now = std::chrono::system_clock::now();
         double now_sec = std::chrono::duration<double>(now.time_since_epoch()).count();

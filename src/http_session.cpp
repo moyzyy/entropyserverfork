@@ -61,18 +61,20 @@ static bool validate_pow(const http::request<http::string_body>& req, RateLimite
     return true;
 }
 
-
-// HTTPS Session state (TLS transport)
-HttpSession::HttpSession(
-    beast::ssl_stream<beast::tcp_stream>&& stream,
-    const ServerConfig& config,
-    ConnectionManager& conn_manager,
-    MessageRelay& relay,
-    RateLimiter& rate_limiter,
-    KeyStorage& key_storage,
-    RedisManager& redis,
-    std::shared_ptr<void> conn_guard
-)
+    /**
+     * HTTPS Session state (TLS transport).
+     * Initializes the encrypted stream and extracts the peer identity for logging.
+     */
+    HttpSession::HttpSession(
+        beast::ssl_stream<beast::tcp_stream>&& stream,
+        const ServerConfig& config,
+        ConnectionManager& conn_manager,
+        MessageRelay& relay,
+        RateLimiter& rate_limiter,
+        KeyStorage& key_storage,
+        RedisManager& redis,
+        std::shared_ptr<void> conn_guard
+    )
     : stream_(std::move(stream))
     , is_tls_(true)
     , config_(config)
@@ -126,10 +128,8 @@ HttpSession::HttpSession(
     }
 }
 
-// Starts the asynchronous session activity
 void HttpSession::run() {
     if (is_tls_) {
-        // Perform SSL/TLS handshake before processing HTTP requests
         auto self = shared_from_this();
         std::get<beast::ssl_stream<beast::tcp_stream>>(stream_).async_handshake(
             ssl::stream_base::server,
@@ -149,11 +149,9 @@ void HttpSession::on_handshake(beast::error_code ec) {
     do_read();
 }
 
-// Initiates the asynchronous read of an HTTP request
 void HttpSession::do_read() {
     req_ = {};
     
-    // Enforce connection timeout to prevent slow-loris attacks
     if (is_tls_) {
         beast::get_lowest_layer(std::get<beast::ssl_stream<beast::tcp_stream>>(stream_)).expires_after(
             std::chrono::seconds(60)); 
@@ -167,33 +165,19 @@ void HttpSession::do_read() {
     parser_->body_limit(config_.max_message_size);
 
     if (is_tls_) {
-        http::async_read(
-            std::get<beast::ssl_stream<beast::tcp_stream>>(stream_),
-            buffer_,
-            *parser_,
-            [self](beast::error_code ec, std::size_t bytes) {
-                self->on_read(ec, bytes);
-            });
+        http::async_read(std::get<beast::ssl_stream<beast::tcp_stream>>(stream_), buffer_, *parser_,
+            [self](beast::error_code ec, std::size_t bytes) { self->on_read(ec, bytes); });
     } else {
-        http::async_read(
-            std::get<beast::tcp_stream>(stream_),
-            buffer_,
-            *parser_,
-            [self](beast::error_code ec, std::size_t bytes) {
-                self->on_read(ec, bytes);
-            });
+        http::async_read(std::get<beast::tcp_stream>(stream_), buffer_, *parser_,
+            [self](beast::error_code ec, std::size_t bytes) { self->on_read(ec, bytes); });
     }
 }
 
-// Handles the completion of an asynchronous read operation
 void HttpSession::on_read(beast::error_code ec, std::size_t  ) {
-    if (ec == http::error::end_of_stream || ec) {
-        return;
-    }
+    if (ec == http::error::end_of_stream || ec) return;
     
     req_ = parser_->release();
     
-    // Apply Global Token-Bucket Rate Limiting using the blinded IP as the identifier.
     std::string b_ip = blind_ip(remote_addr_);
     auto limit_res = rate_limiter_.check("global:" + b_ip, config_.global_rate_limit, 10);
     if (!limit_res.allowed) {
@@ -205,8 +189,6 @@ void HttpSession::on_read(beast::error_code ec, std::size_t  ) {
 }
 
 void HttpSession::handle_request() {
-    
-    // Check for WebSocket Upgrade
     if (websocket::is_upgrade(req_)) {
         upgrade_to_websocket();
         return;
@@ -215,15 +197,11 @@ void HttpSession::handle_request() {
     auto target = req_.target();
     auto method = req_.method();
     
-    // Handle CORS Preflight
     if (method == http::verb::options) {
         send_response(handle_cors_preflight());
         return;
     }
     
-    // --- Routing Table ---
-
-    // Health Checks & Metrics
     if (target == "/health" && method == http::verb::get) {
         send_response(health_handler_.handle_health(req_.version()));
     } else if (target == "/stats" && method == http::verb::get) {
@@ -240,8 +218,6 @@ void HttpSession::handle_request() {
         } else {
             send_response(handle_not_found());
         }
-
-    // Key Management APIs
     } else if (target.find("/keys/upload") == 0 && method == http::verb::post) {
         auto res = rate_limiter_.check("up:" + blind_ip(remote_addr_), config_.keys_upload_limit, 60);
         if (!res.allowed) send_response(handle_rate_limited(res));
@@ -254,16 +230,12 @@ void HttpSession::handle_request() {
         auto res = rate_limiter_.check("keys_rand:" + blind_ip(remote_addr_), config_.keys_random_limit, 60);
         if (!res.allowed) send_response(handle_rate_limited(res));
         else send_response(identity_handler_.handle_keys_random(req_, remote_addr_));
-
-    // Message Relay APIs (HTTP fallback)
     } else if (target.find("/relay") == 0 && target.find("/relay/multicast") == std::string::npos && method == http::verb::post) {
         auto res = rate_limiter_.check("relay:" + blind_ip(remote_addr_), config_.relay_limit, 60);
         if (!res.allowed) send_response(handle_rate_limited(res));
         else send_response(handle_relay());
     } else if (target.find("/relay/multicast") == 0 && method == http::verb::post) {
         send_response(handle_relay_multicast());
-
-    // Proof-of-Work & Identity
     } else if (target.find("/pow/challenge") == 0 && method == http::verb::get) {
         auto res = rate_limiter_.check("pow_limit:" + blind_ip(remote_addr_), config_.pow_rate_limit, 60);
         if (!res.allowed) send_response(handle_rate_limited(res));
@@ -280,16 +252,11 @@ void HttpSession::handle_request() {
         auto res = rate_limiter_.check("burn:" + blind_ip(remote_addr_), config_.account_burn_limit, 300); 
         if (!res.allowed) send_response(handle_rate_limited(res));
         else send_response(identity_handler_.handle_account_burn(req_, remote_addr_));
-
     } else {
         send_response(handle_not_found());
     }
 }
 
-
-// Deprecated/Moved methods block removed
-
-// Blinds an IP address using the server's secret salt.
 std::string HttpSession::blind_ip(const std::string& ip) {
     std::string data = ip + config_.secret_salt;
     unsigned char hash[SHA256_DIGEST_LENGTH];
@@ -537,7 +504,6 @@ http::response<http::string_body> HttpSession::handle_rate_limited(const RateLim
     return res;
 }
 
-// PoW challenge moved
 
 
 template<class Body>
@@ -582,7 +548,7 @@ void HttpSession::add_cors_headers(http::response<Body>& res) {
         } 
     } 
     
-    // Automatic allowance for local development and Tauri apps
+    //for local development and Tauri apps
     if (!res.count(http::field::access_control_allow_origin) && !origin.empty()) {
         if (origin.find("localhost") != std::string::npos || 
             origin.find("tauri://") != std::string::npos || 
@@ -936,34 +902,68 @@ void HttpSession::upgrade_to_websocket() {
                 
                 if (type == "fetch_key") {
                     if (obj.contains("target_hash")) {
-                        std::string target = std::string(obj["target_hash"].as_string());
+                        std::string target_str = std::string(obj["target_hash"].as_string());
                         std::string req_id = obj.contains("req_id") ? std::string(obj["req_id"].as_string()) : "";
                         
                         json::object response;
                         response["type"] = "key_response";
                         response["req_id"] = req_id;
-                        response["target_hash"] = target;
                         
+                        // Parse potential batch request (comma separated)
+                        std::vector<std::string> target_hashes;
+                        std::stringstream ss(target_str);
+                        std::string item;
+                        while (std::getline(ss, item, ',')) {
+                            if (!item.empty()) target_hashes.push_back(item);
+                        }
+
+                        if (target_hashes.empty()) {
+                            response["error"] = "No target hash provided";
+                            session->send_text(json::serialize(response));
+                            return;
+                        }
+
                         // Enforce Rate Limit for fetches
                         auto b_ip = conn_mgr_ptr->blind_id(session->remote_address());
-                        auto limit_res = rate_limiter_ptr->check("fetch:" + b_ip, 200, 60); // 200/min
+                        auto limit_res = rate_limiter_ptr->check("fetch:" + b_ip, 200, 60, target_hashes.size()); 
                         if (!limit_res.allowed) {
                             response["error"] = "Rate limit exceeded";
                             session->send_text(json::serialize(response));
                             return;
                         }
 
-                        std::string bundle = key_storage_ptr->get_bundle(target);
-                        if (bundle.empty()) {
-                            response["found"] = false;
+                        if (target_hashes.size() == 1) {
+                            // Single fetch (compatible mode)
+                            std::string target = target_hashes[0];
+                            std::string bundle = key_storage_ptr->get_bundle(target);
+                            if (bundle.empty()) {
+                                response["found"] = false;
+                            } else {
+                                response["found"] = true;
+                                try {
+                                    response["bundle"] = json::parse(bundle);
+                                } catch(...) { response["found"] = false; }
+                            }
                         } else {
-                            response["found"] = true;
-                            try {
-                                response["bundle"] = json::parse(bundle);
-                            } catch(...) { response["found"] = false; }
+                            // Batch/Decoy fetch
+                            json::object bundles_map;
+                            bool any_found = false;
+                            for (const auto& h : target_hashes) {
+                                std::string b = key_storage_ptr->get_bundle(h);
+                                if (!b.empty()) {
+                                    try {
+                                        bundles_map[h] = json::parse(b);
+                                        any_found = true;
+                                    } catch(...) { bundles_map[h] = nullptr; }
+                                } else {
+                                    bundles_map[h] = nullptr;
+                                }
+                            }
+                            response["found"] = any_found;
+                            response["bundles"] = bundles_map;
                         }
                         
-                        TrafficNormalizer::pad_json(response, 1024);
+                        TrafficNormalizer::pad_json(response, 1152);
                         session->send_text(json::serialize(response));
                     }
                     return;

@@ -14,19 +14,25 @@ namespace json = boost::json;
 
 namespace entropy {
 
-ConnectionManager::ConnectionManager(const std::string& salt) : salt_(salt) {
-}
+    /**
+     * ConnectionManager Constructor.
+     * Initializes the manager with a server-specific salt for ID blinding.
+     */
+    ConnectionManager::ConnectionManager(const std::string& salt) : salt_(salt) {}
 
-// Delivers a message received from Redis pub/sub to a local session if it exists.
-void ConnectionManager::process_distributed_message_for_blinded_id(const std::string& blinded_id, const std::string& message_json) {
-    std::shared_lock lock(connections_mutex_);
-    auto it = connections_.find(blinded_id);
-    if (it != connections_.end()) {
-        if (auto session = it->second.lock()) {
-            session->send_text(message_json);
+    /**
+     * Routes a distributed message from the Redis pub/sub layer to a local session.
+     * Uses blinded ID mapping to preserve anonymity in the routing table.
+     */
+    void ConnectionManager::process_distributed_message_for_blinded_id(const std::string& blinded_id, const std::string& message_json) {
+        std::shared_lock lock(connections_mutex_);
+        auto it = connections_.find(blinded_id);
+        if (it != connections_.end()) {
+            if (auto session = it->second.lock()) {
+                session->send_text(message_json);
+            }
         }
     }
-}
 
 // Parses a distributed message and routes it to one or more local recipients.
 void ConnectionManager::process_distributed_message(const std::string& message_json) {
@@ -107,53 +113,42 @@ bool ConnectionManager::add_connection_with_limit(const std::string& pub_key_has
     return true;
 }
 
-// Cleans up tracking data when a session terminates.
-void ConnectionManager::remove_session(WebSocketSession* session) {
-    if (!session) return;
-    
-    std::unique_lock lock(connections_mutex_);
-    
-    std::string b_ip = blind_id(session->remote_address());
-    std::string user_data = session->get_user_data();
-    
-    // Remove primary blinded ID mapping
-    if (!user_data.empty()) {
-        std::string blinded = blind_id(user_data);
-        auto it = connections_.find(blinded);
-        if (it != connections_.end()) {
-            if (auto existing = it->second.lock()) {
-                if (existing.get() == session) {
+    void ConnectionManager::remove_session(WebSocketSession* session) {
+        if (!session) return;
+        
+        std::unique_lock lock(connections_mutex_);
+        std::string b_ip = blind_id(session->remote_address());
+        std::string user_data = session->get_user_data();
+        
+        if (!user_data.empty()) {
+            std::string blinded = blind_id(user_data);
+            auto it = connections_.find(blinded);
+            if (it != connections_.end()) {
+                if (auto existing = it->second.lock()) {
+                    if (existing.get() == session) connections_.erase(it);
+                } else {
                     connections_.erase(it);
                 }
-            } else {
-                connections_.erase(it);
             }
         }
-    }
-    
-    // Remove all associated alias mappings
-    for (const auto& alias : session->get_aliases()) {
-        std::string blinded = blind_id(alias);
-        auto it = connections_.find(blinded);
-        if (it != connections_.end()) {
-            if (auto existing = it->second.lock()) {
-                if (existing.get() == session) {
+        
+        for (const auto& alias : session->get_aliases()) {
+            std::string blinded = blind_id(alias);
+            auto it = connections_.find(blinded);
+            if (it != connections_.end()) {
+                if (auto existing = it->second.lock()) {
+                    if (existing.get() == session) connections_.erase(it);
+                } else {
                     connections_.erase(it);
                 }
-            } else {
-                connections_.erase(it);
             }
         }
+        
+        if (session->is_authenticated()) {
+            MetricsRegistry::instance().decrement_gauge("active_connections");
+            session->set_authenticated(false);
+        }
     }
-    
-    // Update global and per-IP connection counters
-    if (session->is_authenticated()) {
-        MetricsRegistry::instance().decrement_gauge("active_connections");
-        session->set_authenticated(false);
-    }
-    
-    // Note: per-IP count decrement is handled by ConnectionGuard in lifecycle
-}
 
 // Returns a direct reference to a session given a public key hash.
 ConnectionManager::SessionPtr ConnectionManager::get_connection(const std::string& pub_key_hash) {
@@ -226,18 +221,21 @@ void ConnectionManager::close_all_connections() {
     }
 }
 
-// Generates a salted SHA256 hash of an identifier (Blinded ID).
-std::string ConnectionManager::blind_id(const std::string& id) const {
-    std::string data = id + salt_;
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256(reinterpret_cast<const unsigned char*>(data.c_str()), data.size(), hash);
-    
-    std::stringstream ss;
-    for(int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+    /**
+     * Generates a salted SHA256 "Blinded ID" to decouple public identity from session tracking.
+     * This provides a primitive layer of metadata resistance for the routing layer.
+     */
+    std::string ConnectionManager::blind_id(const std::string& id) const {
+        std::string data = id + salt_;
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256(reinterpret_cast<const unsigned char*>(data.c_str()), data.size(), hash);
+        
+        std::stringstream ss;
+        for(int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+        }
+        return ss.str();
     }
-    return ss.str();
-}
 
 bool ConnectionManager::increment_ip_count(const std::string& ip, size_t limit) {
     std::unique_lock lock(connections_mutex_);
