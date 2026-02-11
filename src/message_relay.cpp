@@ -398,6 +398,7 @@ void MessageRelay::relay_group_message(const boost::json::array& targets,
             json::object clean_msg;
             clean_msg["type"] = "sealed_message";
             clean_msg["body"] = target_obj.at("body");
+            clean_msg["sender"] = sender->get_user_data();
             if (target_obj.contains("msg_type")) clean_msg["msg_type"] = target_obj.at("msg_type");
             
             std::string final_json = json::serialize(clean_msg);

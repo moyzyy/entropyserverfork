@@ -2,6 +2,7 @@
 #include "connection_manager.hpp"
 #include "server_config.hpp" 
 #include "challenge.hpp"
+#include "security_logger.hpp"
 #include <openssl/crypto.h>
 #include <iostream>
 #include <chrono>
@@ -31,7 +32,7 @@ namespace entropy {
             running_ = true;
             subscriber_thread_ = std::thread(&RedisManager::subscriber_loop, this);
         } catch (const std::exception& e) {
-            std::cerr << "[!] Redis connection failed: " << e.what() << "\n";
+            SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis connection failed: " + std::string(e.what()));
             connected_ = false;
         }
     }
@@ -127,7 +128,7 @@ namespace entropy {
         }
         return result;
     } catch (const std::exception& e) {
-        std::cerr << "[!] Redis rate limit error: " << e.what() << "\n";
+        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis rate limit error: " + std::string(e.what()));
         return result; 
     }
 }
@@ -147,7 +148,7 @@ void RedisManager::publish_message(const std::string& recipient_hash, const std:
         std::string channel = "relay:" + blinded;
         redis_->publish(channel, message_json);
     } catch (const std::exception& e) {
-        std::cerr << "[!] Redis publish failed: " << e.what() << "\n";
+        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis publish failed: " + std::string(e.what()));
     }
 }
 
@@ -214,7 +215,7 @@ void RedisManager::subscriber_loop() {
             }
         } catch (const std::exception& e) {
             if (running_) {
-                std::cerr << "[!] Redis subscriber error (reconnecting...): " << e.what() << "\n";
+                SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis subscriber error (reconnecting...): " + std::string(e.what()));
                 std::this_thread::sleep_for(std::chrono::seconds(2));
             }
         }
@@ -232,7 +233,7 @@ bool RedisManager::store_offline_message(const std::string& user_hash, const std
         redis_->expire(key, 86400);   // Messages expire after 24 hours
         return true;
     } catch (const std::exception& e) {
-        std::cerr << "[!] Redis store_message failed: " << e.what() << "\n";
+        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis store_message failed: " + std::string(e.what()));
         return false;
     }
 }
@@ -258,7 +259,7 @@ std::vector<std::string> RedisManager::retrieve_offline_messages(const std::stri
                     std::back_inserter(messages));
         
     } catch (const std::exception& e) {
-        std::cerr << "[!] Redis retrieve_messages failed: " << e.what() << "\n";
+        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis retrieve_messages failed: " + std::string(e.what()));
     }
     return messages;
 }
@@ -280,7 +281,7 @@ bool RedisManager::store_user_bundle(const std::string& user_hash, const std::st
         
         return true;
     } catch (const std::exception& e) {
-        std::cerr << "[!] Redis store_keys failed: " << e.what() << "\n";
+        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis store_keys failed: " + std::string(e.what()));
         return false;
     }
 }
@@ -293,7 +294,7 @@ std::string RedisManager::get_user_bundle(const std::string& user_hash) {
         auto val = redis_->get(key);
         if (val) return *val;
     } catch (const std::exception& e) {
-        std::cerr << "[!] Redis get_keys failed: " << e.what() << "\n";
+        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis get_keys failed: " + std::string(e.what()));
     }
     return "";
 }
@@ -337,7 +338,7 @@ bool RedisManager::register_nickname(const std::string& nickname, const std::str
         return true;
 
     } catch (const std::exception& e) {
-        std::cerr << "[!] Redis register_nickname failed: " << e.what() << "\n";
+        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis register_nickname failed: " + std::string(e.what()));
         return false;
     }
 }
@@ -362,7 +363,7 @@ std::string RedisManager::resolve_nickname(const std::string& nickname) {
         auto val = redis_->get(key);
         if (val) return *val;
     } catch (const std::exception& e) {
-        std::cerr << "[!] Redis resolve_nickname failed: " << e.what() << "\n";
+        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis resolve_nickname failed: " + std::string(e.what()));
     }
     return "";
 }

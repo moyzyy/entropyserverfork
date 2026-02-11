@@ -124,7 +124,9 @@ void WebSocketSession::accept(
 
     auto req_ptr = std::make_shared<http::request<Body, http::basic_fields<Allocator>>>(std::move(req));
     auto handler = [self, on_accept, req_ptr](beast::error_code ec) {
-        if (ec) std::cerr << "[!] WebSocket async_accept error: " << ec.message() << "\n";
+        if (ec) {
+            SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, self->remote_addr_, "WebSocket async_accept error: " + ec.message());
+        }
         if (on_accept) on_accept(ec);
     };
     

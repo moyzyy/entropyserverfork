@@ -358,6 +358,7 @@ ENTROPY SECURE MESSAGING SERVER v2.0
     // Flag to track server running state
         std::atomic<bool> running{true};
         
+        // Initialize the listener
         auto listener = std::make_shared<entropy::Listener>(
             ioc,
             ssl_ctx,
@@ -371,19 +372,38 @@ ENTROPY SECURE MESSAGING SERVER v2.0
         );
         listener->run();
         
+        SecurityLogger::log(SecurityLogger::Level::CRITICAL, SecurityLogger::EventType::AUTH_SUCCESS, "internal", 
+                          "Entropy Server Online - Cluster Port: " + std::to_string(config.port));
+
         /**
-         * Orchestrates a graceful shutdown by closing the listener, terminating the connection manager,
-         * and waiting for current I/O operations to drain.
+         * Orchestrates a graceful shutdown sequence.
+         * Closes the acceptor first, then drains active connections, and waits for threads to join.
          */
         net::signal_set signals(ioc, SIGINT, SIGTERM);
         signals.async_wait(
             [&ioc, &running, &conn_manager, listener, &cleanup_timer](beast::error_code const&, int sig) {
-                SecurityLogger::log(SecurityLogger::Level::INFO, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Initiating graceful shutdown");
+                SecurityLogger::log(SecurityLogger::Level::CRITICAL, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", 
+                                  "SIG" + std::string(sig == SIGINT ? "INT" : "TERM") + " received. Initiating extremely graceful shutdown...");
+                
                 running = false;
+                
+                // Stop accepting new connections
+                listener->stop();
+                
+                // Cancel background maintenance tasks
                 beast::error_code ec;
                 cleanup_timer.cancel(ec);
-                listener->stop();
+                
+                // Force-close all existing WebSocket sessions to flush buffers
                 conn_manager.close_all_connections();
+
+                // Setup a safety timeout to force termination if threads hang
+                auto shutdown_guard = std::make_shared<net::steady_timer>(ioc);
+                shutdown_guard->expires_after(std::chrono::seconds(3));
+                shutdown_guard->async_wait([&ioc, shutdown_guard](beast::error_code) {
+                    SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Graceful shutdown timeout reached. Forcing IO stop.");
+                    ioc.stop(); 
+                });
             });
         
         std::vector<std::thread> threads;
@@ -391,15 +411,27 @@ ENTROPY SECURE MESSAGING SERVER v2.0
         
         for (int i = 0; i < config.thread_count - 1; ++i) {
             threads.emplace_back([&ioc] {
-                ioc.run();
+                try {
+                    ioc.run();
+                } catch (const std::exception& e) {
+                    SecurityLogger::log(SecurityLogger::Level::CRITICAL, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Worker thread fatal error: " + std::string(e.what()));
+                }
             });
         }
         
-        ioc.run();
+        try {
+            ioc.run();
+        } catch (const std::exception& e) {
+            SecurityLogger::log(SecurityLogger::Level::CRITICAL, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Main thread fatal error: " + std::string(e.what()));
+        }
         
         for (auto& t : threads) {
-            t.join();
+            if (t.joinable()) t.join();
         }
+        
+        SecurityLogger::log(SecurityLogger::Level::CRITICAL, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Entropy Server Offline.");
+        
+        return 0;
         
         running = false;
         

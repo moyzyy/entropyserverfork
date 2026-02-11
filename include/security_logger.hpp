@@ -41,6 +41,18 @@ public:
      */
     static void log(Level level, EventType event, const std::string& remote_addr, 
                    const std::string& message = "") {
+        static Level min_level = []() {
+            const char* env = std::getenv("ENTROPY_LOG_LEVEL");
+            if (!env) return Level::INFO;
+            std::string s(env);
+            if (s == "CRITICAL") return Level::CRITICAL;
+            if (s == "ERROR") return Level::ERROR;
+            if (s == "WARNING") return Level::WARNING;
+            return Level::INFO;
+        }();
+        
+        if (level < min_level) return;
+
         auto now = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
         
@@ -52,8 +64,6 @@ public:
            << "[" << level_to_string(level) << "] "
            << "[" << event_to_string(event) << "] ";
         
-        // A random salt is generated and rotated every 6 hours.
-        // This ensures Forward Secrecy for logs
         static std::string log_salt;
         static std::chrono::steady_clock::time_point last_rotation;
         static std::mutex log_mutex;
@@ -64,7 +74,7 @@ public:
         if (log_salt.empty() || std::chrono::duration_cast<std::chrono::hours>(now_steady - last_rotation).count() >= 6) {
             unsigned char b[32];
             if (RAND_bytes(b, 32) != 1) {
-                std::cerr << "[CRITICAL] CSPRNG failure in SecurityLogger. Terminating instance for safety.\n";
+                std::cerr << "[CRITICAL] CSPRNG failure in SecurityLogger. Terminating.\n";
                 std::terminate(); 
             }
             std::stringstream salt_ss;
@@ -72,12 +82,13 @@ public:
             log_salt = salt_ss.str();
             last_rotation = now_steady;
             
-            std::cout << "[" << std::put_time(&gmt, "%Y-%m-%d %H:%M:%S") << " UTC] [INFO] [SECURITY] msg=\"IP blinding salt rotated for log forward secrecy\"\n";
+            if (Level::INFO >= min_level) {
+                std::cout << "[" << std::put_time(&gmt, "%Y-%m-%d %H:%M:%S") << " UTC] [INFO] [SECURITY] msg=\"IP blinding salt rotated for log forward secrecy\"\n";
+            }
         }
         
-        // Blind the IP address using the current session salt
         std::string hidden_ip = remote_addr;
-        if (remote_addr != "unknown") {
+        if (remote_addr != "unknown" && remote_addr != "internal" && remote_addr != "SYSTEM") {
             std::string data = remote_addr + log_salt;
             unsigned char hash[SHA256_DIGEST_LENGTH];
             SHA256(reinterpret_cast<const unsigned char*>(data.c_str()), data.size(), hash);
@@ -92,11 +103,10 @@ public:
             ss << " msg=\"" << sanitize_log_message(message) << "\"";
         }
         
-        // Log to appropriate destination based on severity
         if (level == Level::ERROR || level == Level::CRITICAL) {
-            std::cerr << ss.str() << "\n";
+            std::cerr << ss.str() << std::endl;
         } else {
-            std::cout << ss.str() << "\n";
+            std::cout << ss.str() << std::endl;
         }
     }
     
