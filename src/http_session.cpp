@@ -43,8 +43,8 @@ namespace entropy {
     , rate_limiter_(rate_limiter)
     , key_storage_(key_storage)
     , redis_(redis)
-    , health_handler_(config, conn_manager)
-    , identity_handler_(config, key_storage, redis, rate_limiter)
+    , health_handler_(std::make_shared<HealthHandler>(config, conn_manager))
+    , identity_handler_(std::make_shared<IdentityHandler>(config, key_storage, redis, rate_limiter))
     , conn_guard_(std::move(conn_guard))
 {
     try {
@@ -75,8 +75,8 @@ HttpSession::HttpSession(
     , rate_limiter_(rate_limiter)
     , key_storage_(key_storage)
     , redis_(redis)
-    , health_handler_(config, conn_manager)
-    , identity_handler_(config, key_storage, redis, rate_limiter)
+    , health_handler_(std::make_shared<HealthHandler>(config, conn_manager))
+    , identity_handler_(std::make_shared<IdentityHandler>(config, key_storage, redis, rate_limiter))
     , conn_guard_(std::move(conn_guard))
 {
     try {
@@ -163,18 +163,18 @@ void HttpSession::handle_request() {
     }
     
     if (target == "/health" && method == http::verb::get) {
-        send_response(health_handler_.handle_health(req_.version()));
+        send_response(health_handler_->handle_health(req_.version()));
     } else if (target == "/stats" && method == http::verb::get) {
         bool is_local = (remote_addr_ == "127.0.0.1" || remote_addr_ == "::1");
-        if (is_local || health_handler_.verify_admin_request(req_)) {
-            send_response(health_handler_.handle_stats(req_));
+        if (is_local || health_handler_->verify_admin_request(req_)) {
+            send_response(health_handler_->handle_stats(req_));
         } else {
             send_response(handle_not_found());
         }
     } else if (target == "/metrics" && method == http::verb::get) {
          bool is_local = (remote_addr_ == "127.0.0.1" || remote_addr_ == "::1");
-         if (is_local || health_handler_.verify_admin_request(req_)) {
-            send_response(health_handler_.handle_metrics(req_.version()));
+         if (is_local || health_handler_->verify_admin_request(req_)) {
+            send_response(health_handler_->handle_metrics(req_.version()));
         } else {
             send_response(handle_not_found());
         }
@@ -382,14 +382,14 @@ void HttpSession::upgrade_to_websocket() {
     ConnectionManager* conn_mgr_ptr = &conn_manager_;
     RateLimiter* rate_limiter_ptr = &rate_limiter_;
     RedisManager* redis_ptr = &redis_;
-    IdentityHandler* identity_handler_ptr = &identity_handler_;
+    auto identity_handler = identity_handler_;
     
     
     size_t max_conns = config_.max_connections_per_ip;
     size_t max_msg_size = 5 * 1024 * 1024; 
 
     ws_session->set_message_handler(
-        [relay_ptr, conn_mgr_ptr, rate_limiter_ptr, redis_ptr, identity_handler_ptr, key_storage_ptr = &key_storage_, max_conns, max_msg_size](
+        [relay_ptr, conn_mgr_ptr, rate_limiter_ptr, redis_ptr, identity_handler, key_storage_ptr = &key_storage_, max_conns, max_msg_size](
             std::shared_ptr<WebSocketSession> session,
             const std::string& data,
             bool is_binary
@@ -457,56 +457,56 @@ void HttpSession::upgrade_to_websocket() {
                 }
 
                 if (type == "pow_challenge") {
-                    auto res = identity_handler_ptr->handle_pow_challenge_ws(obj, session->remote_address());
+                    auto res = identity_handler->handle_pow_challenge_ws(obj, session->remote_address());
                     TrafficNormalizer::pad_json(res, 1536);
                     session->send_text(json::serialize(res));
                     return;
                 }
 
                 if (type == "fetch_key_random") {
-                    auto res = identity_handler_ptr->handle_keys_random_ws(obj, session->remote_address());
+                    auto res = identity_handler->handle_keys_random_ws(obj, session->remote_address());
                     TrafficNormalizer::pad_json(res, 1536);
                     session->send_text(json::serialize(res));
                     return;
                 }
 
                 if (type == "keys_upload") {
-                    auto res = identity_handler_ptr->handle_keys_upload_ws(obj, session->remote_address());
+                    auto res = identity_handler->handle_keys_upload_ws(obj, session->remote_address());
                     TrafficNormalizer::pad_json(res, 1536);
                     session->send_text(json::serialize(res));
                     return;
                 }
 
                 if (type == "fetch_key") {
-                    auto res = identity_handler_ptr->handle_keys_fetch_ws(obj, session->remote_address());
+                    auto res = identity_handler->handle_keys_fetch_ws(obj, session->remote_address());
                     TrafficNormalizer::pad_json(res, 1536);
                     session->send_text(json::serialize(res));
                     return;
                 }
 
                 if (type == "nickname_lookup") {
-                    auto res = identity_handler_ptr->handle_nickname_lookup_ws(obj, session->remote_address());
+                    auto res = identity_handler->handle_nickname_lookup_ws(obj, session->remote_address());
                     TrafficNormalizer::pad_json(res, 1536);
                     session->send_text(json::serialize(res));
                     return;
                 }
 
                 if (type == "nickname_register") {
-                    auto res = identity_handler_ptr->handle_nickname_register_ws(obj, session->remote_address());
+                    auto res = identity_handler->handle_nickname_register_ws(obj, session->remote_address());
                     TrafficNormalizer::pad_json(res, 1536);
                     session->send_text(json::serialize(res));
                     return;
                 }
 
                 if (type == "account_burn") {
-                    auto res = identity_handler_ptr->handle_account_burn_ws(obj, session->remote_address());
+                    auto res = identity_handler->handle_account_burn_ws(obj, session->remote_address());
                     TrafficNormalizer::pad_json(res, 1536);
                     session->send_text(json::serialize(res));
                     return;
                 }
 
                 if (type == "link_preview") {
-                    auto res = identity_handler_ptr->handle_link_preview_ws(obj, session->remote_address());
+                    auto res = identity_handler->handle_link_preview_ws(obj, session->remote_address());
                     TrafficNormalizer::pad_json(res, 1536);
                     session->send_text(json::serialize(res));
                     return;

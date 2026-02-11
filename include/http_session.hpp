@@ -78,9 +78,9 @@ private:
     KeyStorage& key_storage_;
     RedisManager& redis_;
     
-    // Handlers
-    HealthHandler health_handler_;
-    IdentityHandler identity_handler_;
+    // Handlers (Shared to survive upgrade to WebSocket)
+    std::shared_ptr<HealthHandler> health_handler_;
+    std::shared_ptr<IdentityHandler> identity_handler_;
     
     std::string remote_addr_;
     std::shared_ptr<void> conn_guard_;
