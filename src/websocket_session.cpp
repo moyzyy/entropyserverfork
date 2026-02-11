@@ -349,11 +349,6 @@ void WebSocketSession::do_close() {
                 if (close_triggered_) return;
 
                 if (write_queue_.empty()) {
-                    if (!is_authenticated()) {
-                        tick_pacing();
-                        return;
-                    }
-                    
                     json::object dummy;
                     dummy["type"] = "dummy_pacing";
                     TrafficNormalizer::pad_json(dummy, ServerConfig::Pacing::packet_size);

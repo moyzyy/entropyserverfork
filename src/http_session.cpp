@@ -19,47 +19,7 @@ namespace json = boost::json;
 
 namespace entropy {
 
-static bool validate_pow(const http::request<http::string_body>& req, RateLimiter& rate_limiter, const std::string& remote_addr, int target_difficulty = -1, const std::string& context = "") {
-    auto seed_it = req.find("X-PoW-Seed");
-    auto nonce_it = req.find("X-PoW-Nonce");
-    
-    if (seed_it == req.end() || nonce_it == req.end()) {
-        SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::POW_FAILURE,
-                          remote_addr, "Missing PoW headers");
-        return false;
-    }
-    
-    std::string seed(seed_it->value());
-    std::string nonce(nonce_it->value());
 
-    
-    if (seed.length() != 64 || !InputValidator::is_valid_hex(seed, 64)) {
-        SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::POW_FAILURE,
-                          remote_addr, "Invalid PoW seed format");
-        return false;
-    }
-    
-    if (nonce.length() > 32 || !std::all_of(nonce.begin(), nonce.end(), ::isdigit)) {
-        SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::POW_FAILURE,
-                          remote_addr, "Invalid PoW nonce format");
-        return false;
-    }
-
-    if (seed.empty() || !rate_limiter.consume_challenge(seed)) {
-        SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::REPLAY_ATTEMPT,
-                          remote_addr, "Challenge seed already consumed or invalid");
-        return false;
-    }
-
-    
-    if (!::entropy::PoWVerifier::verify(seed, nonce, context, target_difficulty)) {
-        SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::POW_FAILURE,
-                          remote_addr, "PoW verification failed (incorrect solution or difficulty mismatch)");
-        return false;
-    }
-    
-    return true;
-}
 
     /**
      * HTTPS Session state (TLS transport).
@@ -218,40 +178,6 @@ void HttpSession::handle_request() {
         } else {
             send_response(handle_not_found());
         }
-    } else if (target.find("/keys/upload") == 0 && method == http::verb::post) {
-        auto res = rate_limiter_.check("up:" + blind_ip(remote_addr_), config_.keys_upload_limit, 60);
-        if (!res.allowed) send_response(handle_rate_limited(res));
-        else send_response(identity_handler_.handle_keys_upload(req_, remote_addr_));
-    } else if (target.find("/keys/fetch") == 0 && method == http::verb::get) {
-        auto res = rate_limiter_.check("fetch:" + blind_ip(remote_addr_), config_.keys_fetch_limit, 60);
-        if (!res.allowed) send_response(handle_rate_limited(res));
-        else send_response(identity_handler_.handle_keys_fetch(req_, remote_addr_));
-    } else if (target.find("/keys/random") == 0 && method == http::verb::get) {
-        auto res = rate_limiter_.check("keys_rand:" + blind_ip(remote_addr_), config_.keys_random_limit, 60);
-        if (!res.allowed) send_response(handle_rate_limited(res));
-        else send_response(identity_handler_.handle_keys_random(req_, remote_addr_));
-    } else if (target.find("/relay") == 0 && target.find("/relay/multicast") == std::string::npos && method == http::verb::post) {
-        auto res = rate_limiter_.check("relay:" + blind_ip(remote_addr_), config_.relay_limit, 60);
-        if (!res.allowed) send_response(handle_rate_limited(res));
-        else send_response(handle_relay());
-    } else if (target.find("/relay/multicast") == 0 && method == http::verb::post) {
-        send_response(handle_relay_multicast());
-    } else if (target.find("/pow/challenge") == 0 && method == http::verb::get) {
-        auto res = rate_limiter_.check("pow_limit:" + blind_ip(remote_addr_), config_.pow_rate_limit, 60);
-        if (!res.allowed) send_response(handle_rate_limited(res));
-        else send_response(identity_handler_.handle_pow_challenge(req_, remote_addr_));
-    } else if (target.find("/nickname/register") == 0 && method == http::verb::post) {
-        auto res = rate_limiter_.check("nick_reg:" + blind_ip(remote_addr_), config_.nick_register_limit, 60);
-        if (!res.allowed) send_response(handle_rate_limited(res));
-        else send_response(identity_handler_.handle_nickname_register(req_, remote_addr_));
-    } else if (target.find("/nickname/lookup") == 0 && method == http::verb::get) {
-        auto res = rate_limiter_.check("nick_look:" + blind_ip(remote_addr_), config_.nick_lookup_limit, 60);
-        if (!res.allowed) send_response(handle_rate_limited(res));
-        else send_response(identity_handler_.handle_nickname_lookup(req_, remote_addr_));
-    } else if (target.find("/account/burn") == 0 && method == http::verb::post) {
-        auto res = rate_limiter_.check("burn:" + blind_ip(remote_addr_), config_.account_burn_limit, 300); 
-        if (!res.allowed) send_response(handle_rate_limited(res));
-        else send_response(identity_handler_.handle_account_burn(req_, remote_addr_));
     } else {
         send_response(handle_not_found());
     }
@@ -270,188 +196,6 @@ std::string HttpSession::blind_ip(const std::string& ip) {
 
 // Relays a single message to a target recipient.
 // Requires PoW bound to the recipient hash to prevent spam-flooding specific accounts.
-http::response<http::string_body> HttpSession::handle_relay() {
-    try {
-        auto json_val = InputValidator::safe_parse_json(req_.body());
-        auto& obj = json_val.as_object();
-        
-        std::string to_hash;
-        if (obj.contains("to") && obj["to"].is_string()) {
-            to_hash = std::string(obj["to"].as_string());
-        }
-
-        int intensity_penalty = 0;
-        int intensity = redis_.get_registration_intensity();
-        if (intensity > 10) intensity_penalty = 2;
-        if (intensity > 50) intensity_penalty = 4;
-        if (intensity > 200) intensity_penalty = 8;
-        
-        long long age = redis_.get_account_age(to_hash);
-        int required_difficulty = ::entropy::PoWVerifier::get_required_difficulty(intensity_penalty, age);
-
-        // Verify PoW is bound to the target 'to' recipient hash.
-        if (!validate_pow(req_, rate_limiter_, remote_addr_, required_difficulty, to_hash)) {
-            SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::AUTH_FAILURE,
-                               remote_addr_, "HTTP relay rejected: invalid PoW or context binding");
-            json::object error;
-            error["error"] = "Invalid or Missing Proof-of-Work (Unbound)";
-            http::response<http::string_body> res{http::status::unauthorized, req_.version()};
-            res.set(http::field::content_type, "application/json");
-            res.body() = json::serialize(error);
-            res.prepare_payload();
-            add_security_headers(res);
-            add_cors_headers(res);
-            return res;
-        }
-        
-        if (!InputValidator::is_valid_hash(to_hash)) {
-            SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::INVALID_INPUT,
-                               remote_addr_, "HTTP relay: invalid recipient format");
-            json::object error;
-            error["error"] = "Invalid recipient format"; 
-            http::response<http::string_body> res{http::status::bad_request, req_.version()};
-            res.set(http::field::content_type, "application/json");
-            res.body() = json::serialize(error);
-            res.prepare_payload();
-            add_security_headers(res);
-            add_cors_headers(res);
-            return res;
-        }
-        
-        std::vector<std::string> recipients = {to_hash};
-        relay_.relay_multicast(recipients, req_.body());
-        
-        json::object response;
-        response["status"] = "relayed";
-        
-        http::response<http::string_body> res{http::status::ok, req_.version()};
-        res.set(http::field::content_type, "application/json");
-        res.body() = json::serialize(response);
-        res.prepare_payload();
-        add_security_headers(res);
-        add_cors_headers(res);
-        return res;
-        
-    } catch (const std::exception& e) {
-        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::INVALID_INPUT,
-                          remote_addr_, "HTTP relay: invalid request format");
-        json::object error;
-        error["error"] = "Invalid request format";
-        http::response<http::string_body> res{http::status::bad_request, req_.version()};
-        res.set(http::field::content_type, "application/json");
-        res.body() = json::serialize(error);
-        res.prepare_payload();
-        add_security_headers(res);
-        add_cors_headers(res);
-        return res;
-    }
-}
-
-// Relays a single message to multiple recipients atomically.
-// This is used for Group Messaging or Multi-Device synchronization.
-// Requires PoW bound to a sorted fingerprint of all recipients.
-http::response<http::string_body> HttpSession::handle_relay_multicast() {
-    try {
-        auto json_val = InputValidator::safe_parse_json(req_.body());
-        auto& obj = json_val.as_object();
-        
-        std::string context_hint = "";
-        std::vector<std::string> recipients;
-        if (obj.contains("recipients") && obj["recipients"].is_array()) {
-            for (const auto& r : obj["recipients"].as_array()) {
-                if (r.is_string()) {
-                    std::string h = std::string(r.as_string());
-                    if (InputValidator::is_valid_hash(h)) {
-                        recipients.push_back(h);
-                    }
-                }
-            }
-        }
-        
-        // Generate a deterministic context fingerprint for the recipient list.
-        // This ensures a single PoW cannot be reused for different recipient sets.
-        if (!recipients.empty()) {
-            std::sort(recipients.begin(), recipients.end());
-            std::string combined;
-            for (const auto& r : recipients) combined += r;
-            unsigned char hash[SHA256_DIGEST_LENGTH];
-            SHA256(reinterpret_cast<const unsigned char*>(combined.c_str()), combined.size(), hash);
-            std::stringstream ss;
-            for(int i = 0; i < SHA256_DIGEST_LENGTH; i++) ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
-            context_hint = ss.str();
-        }
-
-        if (!validate_pow(req_, rate_limiter_, remote_addr_, -1, context_hint)) {
-            SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::AUTH_FAILURE,
-                               remote_addr_, "Multicast relay rejected: invalid PoW or unbound context fingerprint");
-            json::object error;
-            error["error"] = "Invalid or Missing Proof-of-Work (Unbound)";
-            http::response<http::string_body> res{http::status::unauthorized, req_.version()};
-            res.set(http::field::content_type, "application/json");
-            res.body() = json::serialize(error);
-            res.prepare_payload();
-            add_security_headers(res);
-            add_cors_headers(res);
-            return res;
-        }
-        
-        if (recipients.empty() || recipients.size() > 100) {
-            SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::INVALID_INPUT,
-                               remote_addr_, "Multicast: invalid or empty recipient list");
-            json::object error;
-            error["error"] = "Invalid recipient count";
-            http::response<http::string_body> res{http::status::bad_request, req_.version()};
-            res.set(http::field::content_type, "application/json");
-            res.body() = json::serialize(error);
-            res.prepare_payload();
-            add_security_headers(res);
-            add_cors_headers(res);
-            return res;
-        }
-        
-        // Multicast operations have higher rate-limiting 'cost' relative to number of recipients.
-        int cost = static_cast<int>(recipients.size());
-        auto limit_res = rate_limiter_.check("relay_multi:" + blind_ip(remote_addr_), 300, 60, cost);
-        if (!limit_res.allowed) {
-            return handle_rate_limited(limit_res);
-        }
-
-        json::object forward_obj;
-        if (obj.contains("envelope")) forward_obj["envelope"] = obj["envelope"];
-        if (obj.contains("ephemeralPub")) forward_obj["ephemeralPub"] = obj["ephemeralPub"];
-        if (obj.contains("nonce")) forward_obj["nonce"] = obj["nonce"];
-        forward_obj["type"] = "sealed_message"; 
-        
-        std::string forward_body = json::serialize(forward_obj);
-        
-        relay_.relay_multicast(recipients, forward_body);
-        
-        json::object response;
-        response["status"] = "multicast_relayed";
-        response["count"] = recipients.size();
-        
-        http::response<http::string_body> res{http::status::ok, req_.version()};
-        res.set(http::field::content_type, "application/json");
-        res.body() = json::serialize(response);
-        res.prepare_payload();
-        add_security_headers(res);
-        add_cors_headers(res);
-        return res;
-        
-    } catch (const std::exception& e) {
-        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::INVALID_INPUT,
-                          remote_addr_, "Multicast relay: invalid request format");
-        json::object error;
-        error["error"] = "Invalid request format";
-        http::response<http::string_body> res{http::status::bad_request, req_.version()};
-        res.set(http::field::content_type, "application/json");
-        res.body() = json::serialize(error);
-        res.prepare_payload();
-        add_security_headers(res);
-        add_cors_headers(res);
-        return res;
-    }
-}
 
 http::response<http::string_body> HttpSession::handle_cors_preflight() {
     http::response<http::string_body> res{http::status::no_content, req_.version()};
@@ -563,7 +307,7 @@ void HttpSession::add_cors_headers(http::response<Body>& res) {
     }
     
     res.set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
-    res.set(http::field::access_control_allow_headers, "Content-Type,Authorization,X-PoW-Seed,X-PoW-Nonce,x-pow-seed,x-pow-nonce,X-Admin-Token");
+    res.set(http::field::access_control_allow_headers, "Content-Type,Authorization,X-PoW-Seed,X-PoW-Nonce,x-pow-seed,x-pow-nonce,X-Admin-Token,X-Identity,X-Signature,X-Timestamp");
     res.set(http::field::access_control_max_age, "86400");
     res.set(http::field::vary, "Origin");
 }
@@ -638,13 +382,14 @@ void HttpSession::upgrade_to_websocket() {
     ConnectionManager* conn_mgr_ptr = &conn_manager_;
     RateLimiter* rate_limiter_ptr = &rate_limiter_;
     RedisManager* redis_ptr = &redis_;
+    IdentityHandler* identity_handler_ptr = &identity_handler_;
     
     
     size_t max_conns = config_.max_connections_per_ip;
     size_t max_msg_size = 5 * 1024 * 1024; 
 
     ws_session->set_message_handler(
-        [relay_ptr, conn_mgr_ptr, rate_limiter_ptr, redis_ptr, key_storage_ptr = &key_storage_, max_conns, max_msg_size](
+        [relay_ptr, conn_mgr_ptr, rate_limiter_ptr, redis_ptr, identity_handler_ptr, key_storage_ptr = &key_storage_, max_conns, max_msg_size](
             std::shared_ptr<WebSocketSession> session,
             const std::string& data,
             bool is_binary
@@ -706,9 +451,64 @@ void HttpSession::upgrade_to_websocket() {
                     json::object pong;
                     pong["type"] = "pong";
                     if (obj.contains("timestamp")) pong["timestamp"] = obj["timestamp"];
-                    if (obj.contains("timestamp")) pong["timestamp"] = obj["timestamp"];
                     TrafficNormalizer::pad_json(pong, 1536);
                     session->send_text(json::serialize(pong));
+                    return;
+                }
+
+                if (type == "pow_challenge") {
+                    auto res = identity_handler_ptr->handle_pow_challenge_ws(obj, session->remote_address());
+                    TrafficNormalizer::pad_json(res, 1536);
+                    session->send_text(json::serialize(res));
+                    return;
+                }
+
+                if (type == "fetch_key_random") {
+                    auto res = identity_handler_ptr->handle_keys_random_ws(obj, session->remote_address());
+                    TrafficNormalizer::pad_json(res, 1536);
+                    session->send_text(json::serialize(res));
+                    return;
+                }
+
+                if (type == "keys_upload") {
+                    auto res = identity_handler_ptr->handle_keys_upload_ws(obj, session->remote_address());
+                    TrafficNormalizer::pad_json(res, 1536);
+                    session->send_text(json::serialize(res));
+                    return;
+                }
+
+                if (type == "fetch_key") {
+                    auto res = identity_handler_ptr->handle_keys_fetch_ws(obj, session->remote_address());
+                    TrafficNormalizer::pad_json(res, 1536);
+                    session->send_text(json::serialize(res));
+                    return;
+                }
+
+                if (type == "nickname_lookup") {
+                    auto res = identity_handler_ptr->handle_nickname_lookup_ws(obj, session->remote_address());
+                    TrafficNormalizer::pad_json(res, 1536);
+                    session->send_text(json::serialize(res));
+                    return;
+                }
+
+                if (type == "nickname_register") {
+                    auto res = identity_handler_ptr->handle_nickname_register_ws(obj, session->remote_address());
+                    TrafficNormalizer::pad_json(res, 1536);
+                    session->send_text(json::serialize(res));
+                    return;
+                }
+
+                if (type == "account_burn") {
+                    auto res = identity_handler_ptr->handle_account_burn_ws(obj, session->remote_address());
+                    TrafficNormalizer::pad_json(res, 1536);
+                    session->send_text(json::serialize(res));
+                    return;
+                }
+
+                if (type == "link_preview") {
+                    auto res = identity_handler_ptr->handle_link_preview_ws(obj, session->remote_address());
+                    TrafficNormalizer::pad_json(res, 1536);
+                    session->send_text(json::serialize(res));
                     return;
                 }
 
@@ -898,108 +698,7 @@ void HttpSession::upgrade_to_websocket() {
                     return;
                 }
 
-                // --- Multiplexed Request Handlers (for single-socket efficiency) ---
-                
-                if (type == "fetch_key") {
-                    if (obj.contains("target_hash")) {
-                        std::string target_str = std::string(obj["target_hash"].as_string());
-                        std::string req_id = obj.contains("req_id") ? std::string(obj["req_id"].as_string()) : "";
-                        
-                        json::object response;
-                        response["type"] = "key_response";
-                        response["req_id"] = req_id;
-                        
-                        // Parse potential batch request (comma separated)
-                        std::vector<std::string> target_hashes;
-                        std::stringstream ss(target_str);
-                        std::string item;
-                        while (std::getline(ss, item, ',')) {
-                            if (!item.empty()) target_hashes.push_back(item);
-                        }
 
-                        if (target_hashes.empty()) {
-                            response["error"] = "No target hash provided";
-                            session->send_text(json::serialize(response));
-                            return;
-                        }
-
-                        // Enforce Rate Limit for fetches
-                        auto b_ip = conn_mgr_ptr->blind_id(session->remote_address());
-                        auto limit_res = rate_limiter_ptr->check("fetch:" + b_ip, 200, 60, target_hashes.size()); 
-                        if (!limit_res.allowed) {
-                            response["error"] = "Rate limit exceeded";
-                            session->send_text(json::serialize(response));
-                            return;
-                        }
-
-                        if (target_hashes.size() == 1) {
-                            // Single fetch (compatible mode)
-                            std::string target = target_hashes[0];
-                            std::string bundle = key_storage_ptr->get_bundle(target);
-                            if (bundle.empty()) {
-                                response["found"] = false;
-                            } else {
-                                response["found"] = true;
-                                try {
-                                    response["bundle"] = json::parse(bundle);
-                                } catch(...) { response["found"] = false; }
-                            }
-                        } else {
-                            // Batch/Decoy fetch
-                            json::object bundles_map;
-                            bool any_found = false;
-                            for (const auto& h : target_hashes) {
-                                std::string b = key_storage_ptr->get_bundle(h);
-                                if (!b.empty()) {
-                                    try {
-                                        bundles_map[h] = json::parse(b);
-                                        any_found = true;
-                                    } catch(...) { bundles_map[h] = nullptr; }
-                                } else {
-                                    bundles_map[h] = nullptr;
-                                }
-                            }
-                            response["found"] = any_found;
-                            response["bundles"] = bundles_map;
-                        }
-                        
-                        TrafficNormalizer::pad_json(response, 1152);
-                        session->send_text(json::serialize(response));
-                    }
-                    return;
-                }
-
-                if (type == "fetch_key_random") {
-                    std::string req_id = obj.contains("req_id") ? std::string(obj["req_id"].as_string()) : "";
-                    int count = 5;
-                    if (obj.contains("count") && obj["count"].is_int64()) count = (int)obj["count"].as_int64();
-                    if (count > 20) count = 20;
-
-                    // Enforce Rate Limit for random fetches
-                    auto b_ip = conn_mgr_ptr->blind_id(session->remote_address());
-                    auto limit_res = rate_limiter_ptr->check("keys_rand:" + b_ip, 50, 60);
-                    if (!limit_res.allowed) {
-                         json::object response;
-                         response["type"] = "key_random_response";
-                         response["req_id"] = req_id;
-                         response["error"] = "Rate limit exceeded";
-                         session->send_text(json::serialize(response));
-                         return;
-                    }
-
-                    auto hashes = redis_ptr->get_random_user_hashes(count);
-                    json::array hash_arr;
-                    for(const auto& h : hashes) hash_arr.push_back(json::value(h));
-
-                    json::object response;
-                    response["type"] = "key_random_response";
-                    response["req_id"] = req_id;
-                    response["hashes"] = hash_arr;
-                    
-                    TrafficNormalizer::pad_json(response, 1024);
-                    session->send_text(json::serialize(response));
-                    return;
-                }
 
                 if (type == "group_multicast") {
                     if (!session->is_authenticated()) {

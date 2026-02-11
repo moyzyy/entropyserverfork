@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <vector>
 #include <boost/json.hpp>
+#include <openssl/bn.h>
 #include <openssl/evp.h>
 
 namespace entropy {
@@ -40,6 +41,75 @@ public:
 
         EVP_MD_CTX_free(ctx);
         EVP_PKEY_free(pkey);
+        return result;
+    }
+
+    /**
+     * Verifies an XEdDSA signature (Ed25519 signature on an X25519 public key).
+     * This converts the Montgomery u-coordinate to a Twisted Edwards y-coordinate.
+     */
+    static bool verify_xeddsa(const std::vector<unsigned char>& x25519_pubkey,
+                             const std::vector<unsigned char>& message,
+                             const std::vector<unsigned char>& signature) {
+        if (x25519_pubkey.size() != 32 || signature.size() != 64) return false;
+
+        // XEdDSA Conversion:
+        // y = (u - 1) / (u + 1) mod p
+        // where u is the X25519 public key.
+        
+        BN_CTX* ctx = BN_CTX_new();
+        if (!ctx) return false;
+        
+        BIGNUM* u = BN_new();
+        // X25519 keys are little-endian.
+        std::vector<unsigned char> u_be = x25519_pubkey;
+        std::reverse(u_be.begin(), u_be.end());
+        BN_bin2bn(u_be.data(), 32, u);
+        
+        BIGNUM* p = BN_new();
+        // Prime p = 2^255 - 19
+        BN_set_bit(p, 255);
+        BN_sub_word(p, 19);
+        
+        const BIGNUM* one = BN_value_one();
+        
+        BIGNUM* u_minus_1 = BN_new();
+        BN_sub(u_minus_1, u, one);
+        BN_nnmod(u_minus_1, u_minus_1, p, ctx);
+        
+        BIGNUM* u_plus_1 = BN_new();
+        BN_add(u_plus_1, u, one);
+        BN_nnmod(u_plus_1, u_plus_1, p, ctx);
+        
+        BIGNUM* inv_u_plus_1 = BN_new();
+        if (!BN_mod_inverse(inv_u_plus_1, u_plus_1, p, ctx)) {
+            BN_free(u); BN_free(p); BN_free(u_minus_1); BN_free(u_plus_1); BN_free(inv_u_plus_1); BN_CTX_free(ctx);
+            return false;
+        }
+        
+        BIGNUM* y = BN_new();
+        BN_mod_mul(y, u_minus_1, inv_u_plus_1, p, ctx);
+        
+        std::vector<unsigned char> ed_pubkey(32, 0);
+        BN_bn2binpad(y, ed_pubkey.data(), 32);
+        
+        // Convert to little-endian for Ed25519 format
+        std::reverse(ed_pubkey.begin(), ed_pubkey.end());
+        
+        // XEdDSA uses the "positive" x-coordinate, which corresponds to 
+        // the sign bit 0 in the Ed25519 bit-string representation.
+        ed_pubkey[31] &= 0x7F; 
+        
+        bool result = verify_ed25519(ed_pubkey, message, signature);
+        
+        BN_free(u);
+        BN_free(p);
+        BN_free(u_minus_1);
+        BN_free(u_plus_1);
+        BN_free(inv_u_plus_1);
+        BN_free(y);
+        BN_CTX_free(ctx);
+        
         return result;
     }
 

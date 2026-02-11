@@ -107,8 +107,7 @@ private:
 
     
     
-    http::response<http::string_body> handle_relay();
-    http::response<http::string_body> handle_relay_multicast();
+
     
     
     template<class Body>
