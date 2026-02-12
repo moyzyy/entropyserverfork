@@ -46,6 +46,4 @@ logs/
 
 .DS_Store
 Thumbs.db
-*.txt
 *.log
-
