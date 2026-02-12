@@ -340,7 +340,7 @@ ENTROPY SECURE MESSAGING SERVER v2.0
         entropy::RedisManager redis(config, conn_manager, config.secret_salt); 
         
         entropy::RateLimiter rate_limiter(redis);
-        entropy::MessageRelay relay(conn_manager, redis, rate_limiter);
+        entropy::MessageRelay relay(conn_manager, redis, rate_limiter, config);
 
         
         net::steady_timer cleanup_timer(ioc, std::chrono::minutes(5));

@@ -7,7 +7,8 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  build-and-test:
+    name: Build & Test (Release)
     runs-on: ubuntu-24.04
     services:
       redis:
@@ -35,32 +36,73 @@ jobs:
           libboost-json-dev \
           gcc-13 \
           g++-13 \
-          python3-websockets \
-          python3-requests \
-          python3-redis \
           redis-tools \
-          redis-server \
           curl
 
     - name: Configure CMake
       run: |
         export CC=gcc-13
         export CXX=g++-13
-        mkdir build
-        cd build
-        cmake -DCMAKE_BUILD_TYPE=Release ..
+        cmake -B build -DCMAKE_BUILD_TYPE=Release
 
     - name: Build
       run: |
-        cd build
-        make -j$(nproc)
+        cmake --build build -j$(nproc)
 
     - name: Run Tests
+      env:
+        CTEST_OUTPUT_ON_FAILURE: 1
       run: |
         cd build
-        ctest --output-on-failure
+        ctest --output-on-failure --verbose
 
-    - name: Run Python E2E Tests
+  sanitizer-analysis:
+    name: Runtime Analysis (ASAN/UBSAN)
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
       run: |
-        chmod +x tests/run_e2e_all.sh
-        ./tests/run_e2e_all.sh
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          libssl-dev \
+          libboost-system-dev \
+          libboost-thread-dev \
+          libboost-json-dev \
+          gcc-13 \
+          g++-13 \
+          redis-tools
+
+    - name: Configure CMake (Sanitizers)
+      run: |
+        export CC=gcc-13
+        export CXX=g++-13
+        cmake -B build_asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+
+    - name: Build
+      run: |
+        cmake --build build_asan -j$(nproc)
+
+    - name: Run Tests (With Sanitizers)
+      env:
+        ASAN_OPTIONS: detect_leaks=1:check_initialization_order=1
+        UBSAN_OPTIONS: print_stacktrace=1
+        CTEST_OUTPUT_ON_FAILURE: 1
+      run: |
+        cd build_asan
+        ctest --output-on-failure --verbose
+    

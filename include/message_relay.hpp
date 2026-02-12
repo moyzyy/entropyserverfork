@@ -10,6 +10,7 @@
 
 namespace json = boost::json;
 
+#include "server_config.hpp"
 namespace entropy {
 
 class WebSocketSession;
@@ -20,7 +21,7 @@ class MessageRelay {
 public:
     static constexpr size_t MAX_MESSAGE_SIZE = 5 * 1024 * 1024; // 5MB Limit per relay
     
-    explicit MessageRelay(ConnectionManager& conn_manager, RedisManager& redis, RateLimiter& rate_limiter);
+    explicit MessageRelay(ConnectionManager& conn_manager, RedisManager& redis, RateLimiter& rate_limiter, const ServerConfig& config);
     ~MessageRelay() = default;
     
 
@@ -62,13 +63,14 @@ public:
     void confirm_delivery(const std::vector<int64_t>& /*ids*/) {}
     
     bool validate_message_size(size_t size) const {
-        return size <= MAX_MESSAGE_SIZE;
+        return size <= config_.max_message_size;
     }
 
 private:
     ConnectionManager& conn_manager_;
     RedisManager& redis_;
     RateLimiter& rate_limiter_;
+    const ServerConfig& config_;
     
     struct RoutingInfo {
         std::string type;

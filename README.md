@@ -88,18 +88,6 @@ Set these environment variables before launching:
 
 ---
 
-## 🧪 Verification
-
-Audit the server integrity using our security and performance tests:
-
-```bash
-# Run Unit Tests
-./run_tests.sh
-
-# Run Security Audit
-python3 tests/security_audit.py
-```
-
 ---
 
 ## 📄 License

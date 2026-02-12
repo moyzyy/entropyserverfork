@@ -10,11 +10,9 @@ The server implements a two-tier protection system:
     - Limits are per-IP (global) and per-IdentityHash (specific).
     - Bursts are allowed but sustained flooding triggers a temporary ignore.
 
-## 2. Blinded Routing
+## 2. Sender-Revealed Routing
 
-The server never learns the mapping between a WebSocket connection and a real-world identity.
-- Clients communicate using **Identity Hashes** (SHA256 of their public key).
-- In a **Sealed Sender** flow, the server cannot see who the sender is; it only sees the intended recipient's hash to facilitate routing.
+Clients communicate using **Identity Hashes** (SHA256 of their public key). In the current implementation, the server operates in a **Sender-Revealed** flow: when a user sends a message, the server attaches that user's identity hash to the package before it is relayed to the recipient. This allows the recipient to verify the sender and enables the server to enforce per-user rate limits.
 
 ## 4. Traffic Normalization (Anti-Analysis)
 

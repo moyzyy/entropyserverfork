@@ -31,10 +31,10 @@ public:
 
     // --- Distributed Messaging (Pub/Sub) ---
     // Publishes a message to a specific recipient hash across all cluster nodes.
-    void publish_message(const std::string& recipient_hash, const std::string& message_json);
+    virtual void publish_message(const std::string& recipient_hash, const std::string& message_json);
     
     // Publishes a message to multiple recipients atomically.
-    void publish_multicast(const std::vector<std::string>& recipients, const std::string& message_json);
+    virtual void publish_multicast(const std::vector<std::string>& recipients, const std::string& message_json);
 
     // Subscribes the current node to receive messages for a user hash.
     void subscribe_user(const std::string& user_hash);
@@ -51,17 +51,17 @@ public:
 
     // --- Anti-Spam Challenges (PoW) ---
     // Issues a cryptographically random seed for a Proof-of-Work challenge.
-    std::string issue_challenge(int ttl_sec);
+    virtual std::string issue_challenge(int ttl_sec);
     
     // Consumes a seed solution, ensuring it cannot be replayed.
-    bool consume_challenge(const std::string& seed);
+    virtual bool consume_challenge(const std::string& seed);
     
     // --- Session & Identity Management ---
     std::string create_session_token(const std::string& user_hash, int ttl_sec);
     bool verify_session_token(const std::string& user_hash, const std::string& token);
 
     // --- Persistent Storage (Offline Messages & Identity Bundles) ---
-    bool store_offline_message(const std::string& user_hash, const std::string& message_json);
+    virtual bool store_offline_message(const std::string& user_hash, const std::string& message_json);
     std::vector<std::string> retrieve_offline_messages(const std::string& user_hash);
     
     bool store_user_bundle(const std::string& user_hash, const std::string& bundle_json);

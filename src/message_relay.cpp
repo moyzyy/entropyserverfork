@@ -27,8 +27,8 @@ namespace entropy {
 // This is used to prevent side-channel analysis of message lengths.
 
 
-MessageRelay::MessageRelay(ConnectionManager& conn_manager, RedisManager& redis, RateLimiter& rate_limiter)
-    : conn_manager_(conn_manager), redis_(redis), rate_limiter_(rate_limiter) {}
+MessageRelay::MessageRelay(ConnectionManager& conn_manager, RedisManager& redis, RateLimiter& rate_limiter, const ServerConfig& config)
+    : conn_manager_(conn_manager), redis_(redis), rate_limiter_(rate_limiter), config_(config) {}
 
 
 
@@ -71,6 +71,15 @@ void MessageRelay::relay_message(const std::string& message_json,
     }
     
     MetricsRegistry::instance().increment_counter("message_total");
+    
+    if (!sender->is_authenticated()) {
+         json::object err;
+         err["type"] = "error";
+         err["code"] = "auth_required";
+         err["message"] = "Identity authentication required for message relay";
+         sender->send_text(json::serialize(err));
+         return;
+    }
     
     auto routing = extract_routing(message_json);
     if (!routing.valid) {

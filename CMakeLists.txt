@@ -22,6 +22,21 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     endif()
 endif()
 
+option(USE_ASAN "Enable AddressSanitizer" OFF)
+option(USE_TSAN "Enable ThreadSanitizer" OFF)
+
+if(USE_ASAN)
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address)
+    message(STATUS "AddressSanitizer enabled")
+endif()
+
+if(USE_TSAN)
+    add_compile_options(-fsanitize=thread)
+    add_link_options(-fsanitize=thread)
+    message(STATUS "ThreadSanitizer enabled")
+endif()
+
 
 find_package(Boost 1.75 REQUIRED COMPONENTS system thread json)
 find_package(OpenSSL REQUIRED)
@@ -136,3 +151,6 @@ add_custom_target(generate_certs
     VERBATIM
 )
 
+
+enable_testing()
+add_subdirectory(tests)

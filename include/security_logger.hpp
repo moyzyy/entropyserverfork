@@ -11,7 +11,6 @@
 
 namespace entropy {
 
-// Logs security events using blinded IP identifiers (salted hash).
 class SecurityLogger {
 public:
     enum class Level {
@@ -32,26 +31,13 @@ public:
         CONNECTION_REJECTED
     };
     
-    /**
-     * Records a security-relevant event with blinded identifiers.
-     * @param level Severity level of the event.
-     * @param event The specific type of security event.
-     * @param remote_addr The source IP address (will be blinded before logging).
-     * @param message Optional descriptive message (will be sanitized).
-     */
+    static void set_min_level(Level level) {
+        get_min_level() = level;
+    }
+
     static void log(Level level, EventType event, const std::string& remote_addr, 
                    const std::string& message = "") {
-        static Level min_level = []() {
-            const char* env = std::getenv("ENTROPY_LOG_LEVEL");
-            if (!env) return Level::INFO;
-            std::string s(env);
-            if (s == "CRITICAL") return Level::CRITICAL;
-            if (s == "ERROR") return Level::ERROR;
-            if (s == "WARNING") return Level::WARNING;
-            return Level::INFO;
-        }();
-        
-        if (level < min_level) return;
+        if (level < get_min_level()) return;
 
         auto now = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
@@ -82,7 +68,7 @@ public:
             log_salt = salt_ss.str();
             last_rotation = now_steady;
             
-            if (Level::INFO >= min_level) {
+            if (Level::INFO >= get_min_level()) {
                 std::cout << "[" << std::put_time(&gmt, "%Y-%m-%d %H:%M:%S") << " UTC] [INFO] [SECURITY] msg=\"IP blinding salt rotated for log forward secrecy\"\n";
             }
         }
@@ -110,6 +96,19 @@ public:
         }
     }
     
+    static std::string sanitize_log_message(const std::string& msg) {
+        std::string result;
+        result.reserve(msg.size());
+        for (char c : msg) {
+            if (c == '"' || c == '\\' || c == '\n' || c == '\r') {
+                result += ' ';
+            } else if (std::isprint(static_cast<unsigned char>(c))) {
+                result += c;
+            }
+        }
+        return result;
+    }
+
 private:
     static std::string level_to_string(Level level) {
         switch (level) {
@@ -134,19 +133,18 @@ private:
             default: return "UNKNOWN_EVENT";
         }
     }
-    
-    // Escapes non-printable characters and quotes to ensure log integrity
-    static std::string sanitize_log_message(const std::string& msg) {
-        std::string result;
-        result.reserve(msg.size());
-        for (char c : msg) {
-            if (c == '"' || c == '\\' || c == '\n' || c == '\r') {
-                result += ' ';
-            } else if (std::isprint(static_cast<unsigned char>(c))) {
-                result += c;
-            }
-        }
-        return result;
+
+    static Level& get_min_level() {
+        static Level min_level = []() {
+            const char* env = std::getenv("ENTROPY_LOG_LEVEL");
+            if (!env) return Level::INFO;
+            std::string s(env);
+            if (s == "CRITICAL") return Level::CRITICAL;
+            if (s == "ERROR") return Level::ERROR;
+            if (s == "WARNING") return Level::WARNING;
+            return Level::INFO;
+        }();
+        return min_level;
     }
 };
 

@@ -4,56 +4,46 @@ The Entropy Server provides a high-performance, stateless relay for decentralize
 
 ## 1. REST API
 
-### `GET /pow/challenge`
-Fetch a new Proof-of-Work challenge.
-- **Parameters**: 
-  - `type`: `registration`, `upload`, `decoy`
-  - `identity_hash`: (Optional) The target identity.
-- **Response**: `200 OK`
-  ```json
-  { "seed": "...", "difficulty": 20 }
-  ```
+The REST API is strictly limited to health monitoring and administrative statistics. All cryptographic operations and identity management occur over WebSockets for performance and state consistency.
 
-### `POST /keys/upload`
-Upload an X3DH key bundle.
-- **Headers**:
-  - `X-PoW-Seed`: The seed provided by the challenge.
-  - `X-PoW-Nonce`: The salt/nonce you found that solves the challenge.
-- **Body**: A signed JSON bundle containing identity keys and pre-keys.
+### `GET /health`
+Returns the operational status of the relay node.
 
-### `GET /keys/fetch`
-Fetch key bundles for one or more users.
-- **Query**: `hashes=hash1,hash2,hash3`
-- **Response**: Map of `identity_hash -> bundle`.
+### `GET /stats`
+Returns anonymized server performance metrics (Total users, message throughput). *Note: Requires Admin Token headers or local loopback access.*
 
-### `POST /account/burn`
-Initiates a **Forensic Burn**.
-- **Requirement**: Must be signed by the private identity key corresponding to the hash.
-- **Action**: Immediately purges all keys, queued messages, and rate-limit history for that ID.
+### `GET /metrics`
+Exposes Prometheus-compatible metrics for monitoring clusters.
 
 ---
 
 ## 2. WebSocket Protocol (`/ws`)
 
-### Connection Handshake
-Clients connect to `/ws`. The server expects an `auth` message within the first 2 seconds.
+The primary protocol for both identity management and messaging.
 
-**Authentication Message**:
-```json
-{
-  "type": "auth",
-  "payload": {
-    "identity_hash": "...",
-    "session_token": "..." // Re-auth
-  }
-}
-```
-OR solve a PoW challenge if no session token exists.
+### Connection
+Clients must upgrade their connection via the `/ws` endpoint.
 
-### Core Events
-- **`send_message`**: Relay an encrypted envelope to a `TargetHash`.
-- **`delivery_ack`**: Client confirms receipt, allowing the server to delete the message from the volatile queue.
-- **`presence_update`**: Broadcast status to authorized peers.
+### Identity & Signaling (Client → Server)
+These messages can be sent after a WebSocket connection is established but *before* or *during* authentication.
+
+- **`pow_challenge`**: Fetch a new SHA-256 challenge.
+  - Payload: `{ "identity_hash": "...", "nickname": "..." (Optional), "intent": "..." (Optional) }`
+- **`keys_upload`**: Standard X3DH/Kyber bundle upload. Requires solved PoW.
+- **`fetch_key`**: Retrieve key bundle for a `target_hash`.
+- **`fetch_key_random`**: Fetch random key bundles for decoy traffic.
+- **`nickname_register`**: Map a nickname to an identity hash.
+- **`nickname_lookup`**: Resolve a name to a hash.
+- **`account_burn`**: Pure all server-side data (requires owner signature).
+
+### Authentication
+- **`auth`**: Authenticate using a solved PoW challenge or a `session_token`.
+  - On success, the server responds with `auth_success` and a fresh token.
+
+### Messaging
+- **`relay_message`**: Sends an encrypted envelope.
+- **`ack`**: Confirms receipt of offline messages.
+- **`ping`**: Dummy/Keepalive traffic.
 
 ---
 

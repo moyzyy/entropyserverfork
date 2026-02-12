@@ -114,10 +114,10 @@ void HttpSession::do_read() {
     
     if (is_tls_) {
         beast::get_lowest_layer(std::get<beast::ssl_stream<beast::tcp_stream>>(stream_)).expires_after(
-            std::chrono::seconds(60)); 
+            std::chrono::seconds(config_.connection_timeout_sec)); 
     } else {
         beast::get_lowest_layer(std::get<beast::tcp_stream>(stream_)).expires_after(
-            std::chrono::seconds(60)); 
+            std::chrono::seconds(config_.connection_timeout_sec)); 
     }
     
     auto self = shared_from_this();
