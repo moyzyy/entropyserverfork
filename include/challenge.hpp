@@ -14,8 +14,6 @@ public:
     static std::string generate_seed() {
         unsigned char buffer[32];
         if (RAND_bytes(buffer, sizeof(buffer)) != 1) {
-            
-            
             throw std::runtime_error("CSPRNG Failure - Entropy Exhausted");
         }
         

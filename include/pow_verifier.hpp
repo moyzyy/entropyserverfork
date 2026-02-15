@@ -14,16 +14,12 @@
 
 namespace entropy {
 
-// Anti-Spam Proof-of-Work (PoW) verification system.
-// Implements a dynamic-difficulty SHA256 challenge-response mechanism.
 class PoWVerifier {
 public:
-    static constexpr int BASE_DIFFICULTY = 4; // Represents number of required leading hex zeros
+    static constexpr int BASE_DIFFICULTY = 4; // number of required leading hex zeros
     
     /**
-     * Calculates the required difficulty based on current server load and account maturity.
-     * Older accounts are rewarded with lower difficulty to improve UX, while
-     * high server load increases difficulty to rate-limit expensive operations globally.
+     * Rewards older accounts with lower difficulty; high load increases difficulty.
      */
     static int get_required_difficulty(int intensity_penalty = 0, long long account_age = 0) {
         size_t connections = static_cast<size_t>(MetricsRegistry::instance().get_gauge("active_connections"));
@@ -44,8 +40,7 @@ public:
     }
 
     /**
-     * Calculates difficulty for nickname registration.
-     * Shorter, more desirable nicknames requires significantly more work to prevent squatting.
+     * Shorter nicknames require higher work to prevent squatting.
      */
     static int get_difficulty_for_nickname(const std::string& nickname, int intensity_penalty = 0, long long account_age = 0) {
         int base = get_required_difficulty(intensity_penalty, account_age);
@@ -56,20 +51,21 @@ public:
     }
 
     /**
-     * Verifies a PoW solution.
-     * @param seed The challenge seed issued by the server.
-     * @param nonce The client-generated solution to the challenge.
-     * @param context Optional operation-specific context (e.g. nickname).
-     * @param target_difficulty Required number of leading hex zeros.
+     * Verifies PoW solution for given difficulty.
      */
-    static bool verify(const std::string& seed, const std::string& nonce, const std::string& context = "", int target_difficulty = -1) {
+    static bool verify(std::string_view seed, std::string_view nonce, std::string_view context = "", int target_difficulty = -1) {
         if (seed.empty() || nonce.empty()) return false;
         
         if (target_difficulty == -1) {
             target_difficulty = get_required_difficulty();
         }
 
-        std::string input = seed + context + nonce;
+        std::string input;
+        input.reserve(seed.size() + context.size() + nonce.size());
+        input += seed;
+        input += context;
+        input += nonce;
+        
         unsigned char hash[SHA256_DIGEST_LENGTH];
         SHA256(reinterpret_cast<const unsigned char*>(input.c_str()), input.size(), hash);
 

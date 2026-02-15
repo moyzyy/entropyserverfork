@@ -43,7 +43,9 @@ public:
 
         RateLimiter& rate_limiter,
         KeyStorage& key_storage,
-        RedisManager& redis
+        RedisManager& redis,
+        std::shared_ptr<HealthHandler> health_handler,
+        std::shared_ptr<IdentityHandler> identity_handler
     )
         : ioc_(ioc)
         , ssl_ctx_(ssl_ctx)
@@ -54,6 +56,8 @@ public:
         , rate_limiter_(rate_limiter)
         , key_storage_(key_storage)
         , redis_(redis)
+        , health_handler_(health_handler)
+        , identity_handler_(identity_handler)
     {
         beast::error_code ec;
         
@@ -99,6 +103,8 @@ private:
     RateLimiter& rate_limiter_;
     KeyStorage& key_storage_;
     RedisManager& redis_;
+    std::shared_ptr<HealthHandler> health_handler_;
+    std::shared_ptr<IdentityHandler> identity_handler_;
     
     void do_accept() {
         acceptor_.async_accept(
@@ -109,8 +115,7 @@ private:
     }
     
     /**
-     * Accepts incoming TCP connections and elevates them to HTTP sessions.
-     * Integrates IP-based connection limits and TLS/Plaintext multiplexing.
+     * Integrates IP-based connection limits and TLS multiplexing.
      */
     void on_accept(beast::error_code ec, tcp::socket socket) {
         if (ec) {
@@ -157,6 +162,8 @@ private:
                         rate_limiter_,
                         key_storage_,
                         redis_,
+                        health_handler_,
+                        identity_handler_,
                         guard
                     )->run();
                 } else {
@@ -168,6 +175,8 @@ private:
                         rate_limiter_,
                         key_storage_,
                         redis_,
+                        health_handler_,
+                        identity_handler_,
                         guard
                     )->run();
                 }
@@ -180,7 +189,7 @@ private:
 
 } 
 
-// Configures the SSL context (TLS 1.2+).
+// Configures the SSL context (TLS 1.2+), might not use, not sure.
 void load_server_certificate(ssl::context& ctx, const std::string& cert_path, const std::string& key_path) {
     ctx.set_options(
         ssl::context::default_workarounds |
@@ -278,7 +287,7 @@ int main(int argc, char* argv[]) {
              SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::INVALID_INPUT, "internal", "No CORS origins configured");
         }
         
-        static const std::string DEFAULT_SALT = "CHANGE_IN_PROD";
+        static const std::string DEFAULT_SALT = "CHANGE_IN_PROD_998811";
         if (config.secret_salt == DEFAULT_SALT) {
             std::cerr << "CRITICAL SECURITY ERROR: DEFAULT SECRET SALT DETECTED\n";
             std::cerr << "Set 'ENTROPY_SECRET_SALT' environment variable immediately!\n";
@@ -329,6 +338,9 @@ ENTROPY SECURE MESSAGING SERVER v2.0
         
         net::io_context ioc{config.thread_count};
         
+        // Blocking pool for long-running Redis operations to prevent IO starvation.
+        net::thread_pool blocking_pool{static_cast<std::size_t>(config.blocking_thread_count)};
+        
         
         ssl::context ssl_ctx{ssl::context::tlsv12};
         if (config.enable_tls) {
@@ -336,8 +348,10 @@ ENTROPY SECURE MESSAGING SERVER v2.0
         }
         
         entropy::ConnectionManager conn_manager(config.secret_salt);
+        conn_manager.start_pacing_loop(ioc, config.pacing.tick_interval_ms);
         
         entropy::RedisManager redis(config, conn_manager, config.secret_salt); 
+        redis.set_blocking_executor(blocking_pool.get_executor());
         
         entropy::RateLimiter rate_limiter(redis);
         entropy::MessageRelay relay(conn_manager, redis, rate_limiter, config);
@@ -358,6 +372,9 @@ ENTROPY SECURE MESSAGING SERVER v2.0
     // Flag to track server running state
         std::atomic<bool> running{true};
         
+        auto health_handler = std::make_shared<entropy::HealthHandler>(config, conn_manager);
+        auto identity_handler = std::make_shared<entropy::IdentityHandler>(config, redis, redis, rate_limiter);
+
         // Initialize the listener
         auto listener = std::make_shared<entropy::Listener>(
             ioc,
@@ -368,41 +385,43 @@ ENTROPY SECURE MESSAGING SERVER v2.0
             relay,
             rate_limiter,
             redis,
-            redis
+            redis,
+            health_handler,
+            identity_handler
         );
         listener->run();
         
         SecurityLogger::log(SecurityLogger::Level::CRITICAL, SecurityLogger::EventType::AUTH_SUCCESS, "internal", 
-                          "Entropy Server Online - Cluster Port: " + std::to_string(config.port));
+                          "Entropy Server Online - Server Port: " + std::to_string(config.port));
+
+        auto work_guard = std::make_shared<net::executor_work_guard<net::io_context::executor_type>>(net::make_work_guard(ioc));
 
         /**
-         * Orchestrates a graceful shutdown sequence.
          * Closes the acceptor first, then drains active connections, and waits for threads to join.
          */
         net::signal_set signals(ioc, SIGINT, SIGTERM);
         signals.async_wait(
-            [&ioc, &running, &conn_manager, listener, &cleanup_timer](beast::error_code const&, int sig) {
+            [&ioc, &conn_manager, listener, &cleanup_timer, &blocking_pool, work_guard](beast::error_code const&, int sig) {
                 SecurityLogger::log(SecurityLogger::Level::CRITICAL, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", 
                                   "SIG" + std::string(sig == SIGINT ? "INT" : "TERM") + " received. Initiating extremely graceful shutdown...");
                 
-                running = false;
-                
-                // Stop accepting new connections
                 listener->stop();
-                
-                // Cancel background maintenance tasks
                 beast::error_code ec;
                 cleanup_timer.cancel(ec);
-                
-                // Force-close all existing WebSocket sessions to flush buffers
                 conn_manager.close_all_connections();
 
-                // Setup a safety timeout to force termination if threads hang
+                std::thread([&blocking_pool, work_guard]() {
+                    blocking_pool.join();
+                    const_cast<net::executor_work_guard<net::io_context::executor_type>&>(*work_guard).reset();
+                }).detach();
+
                 auto shutdown_guard = std::make_shared<net::steady_timer>(ioc);
-                shutdown_guard->expires_after(std::chrono::seconds(3));
-                shutdown_guard->async_wait([&ioc, shutdown_guard](beast::error_code) {
-                    SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Graceful shutdown timeout reached. Forcing IO stop.");
-                    ioc.stop(); 
+                shutdown_guard->expires_after(std::chrono::seconds(15)); 
+                shutdown_guard->async_wait([&ioc, shutdown_guard](beast::error_code ec) {
+                    if (!ec) {
+                        SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Graceful shutdown timeout reached. Forcing IO stop.");
+                        ioc.stop(); 
+                    }
                 });
             });
         
@@ -425,15 +444,12 @@ ENTROPY SECURE MESSAGING SERVER v2.0
             SecurityLogger::log(SecurityLogger::Level::CRITICAL, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Main thread fatal error: " + std::string(e.what()));
         }
         
+    
         for (auto& t : threads) {
             if (t.joinable()) t.join();
         }
         
         SecurityLogger::log(SecurityLogger::Level::CRITICAL, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Entropy Server Offline.");
-        
-        return 0;
-        
-        running = false;
         
         return 0;
         

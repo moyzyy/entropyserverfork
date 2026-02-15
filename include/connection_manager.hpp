@@ -5,6 +5,9 @@
 #include <unordered_set>
 #include <shared_mutex>
 #include <memory>
+#include <boost/asio.hpp>
+
+namespace net = boost::asio;
 
 namespace entropy {
 
@@ -16,7 +19,7 @@ public:
     using WeakSessionPtr = std::weak_ptr<WebSocketSession>;
     
     explicit ConnectionManager(const std::string& salt);
-    ~ConnectionManager() = default;
+    ~ConnectionManager();
     
     ConnectionManager(const ConnectionManager&) = delete;
     ConnectionManager& operator=(const ConnectionManager&) = delete;
@@ -30,10 +33,10 @@ public:
     
     SessionPtr get_connection(const std::string& pub_key_hash);
     
-    void process_distributed_message(const std::string& message_json);
-    void process_distributed_message_for_blinded_id(const std::string& blinded_id, const std::string& message_json);
     
 
+    void start_pacing_loop(net::io_context& ioc, int interval_ms);
+    
     bool is_online(const std::string& pub_key_hash);
     
     size_t connection_count() const;
@@ -49,12 +52,15 @@ public:
     std::string blind_id(const std::string& id) const;
 
 private:
+    void on_pacing_tick(int interval_ms);
+    
     std::unordered_map<std::string, WeakSessionPtr> connections_;
-    
+    std::unordered_map<WebSocketSession*, WeakSessionPtr> unique_sessions_;
     std::unordered_map<std::string, size_t> ip_counts_;
-    
     mutable std::shared_mutex connections_mutex_;
     std::string salt_;
+    std::unique_ptr<net::steady_timer> pacing_timer_;
+    std::vector<SessionPtr> sessions_to_flush_cache_;
 };
 
 } 

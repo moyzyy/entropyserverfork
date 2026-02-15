@@ -40,6 +40,8 @@ public:
         RateLimiter& rate_limiter,
         KeyStorage& key_storage,
         RedisManager& redis,
+        std::shared_ptr<HealthHandler> health_handler,
+        std::shared_ptr<IdentityHandler> identity_handler,
         std::shared_ptr<void> conn_guard
     );
     
@@ -52,6 +54,8 @@ public:
         RateLimiter& rate_limiter,
         KeyStorage& key_storage,
         RedisManager& redis,
+        std::shared_ptr<HealthHandler> health_handler,
+        std::shared_ptr<IdentityHandler> identity_handler,
         std::shared_ptr<void> conn_guard
     );
     
@@ -59,6 +63,8 @@ public:
     
      
     void run();
+    
+    net::any_io_executor get_executor();
 
 private:
     std::variant<
@@ -97,22 +103,14 @@ private:
     
     void upgrade_to_websocket();
     
-    // Delegated to Handlers or retained wrappers
     http::response<http::string_body> handle_cors_preflight();
     http::response<http::string_body> handle_not_found();
     http::response<http::string_body> handle_rate_limited(const RateLimitResult& res_info);
 
     std::string blind_ip(const std::string& ip);
 
-
-    
-    
-
-    
-    
     template<class Body>
     void add_security_headers(http::response<Body>& res);
-    
     
     template<class Body>
     void add_cors_headers(http::response<Body>& res);

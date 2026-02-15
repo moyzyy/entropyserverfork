@@ -21,6 +21,9 @@ protected:
     MessageRelay relay{cm, redis, rate_limiter, config};
     IdentityHandler id_handler{config, redis, redis, rate_limiter};
     asio::io_context ioc;
+    void SetUp() override {
+        redis.set_blocking_executor(ioc.get_executor());
+    }
 };
 TEST_F(SoakStabilityTest, MessageRelayThrashing) {
     const int num_threads = 4;

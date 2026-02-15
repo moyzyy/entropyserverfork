@@ -26,6 +26,6 @@ TEST_F(BenchmarkTest, PoWVerificationSmoke) {
     
     for (int i = 0; i < iterations; ++i) {
         bool result = PoWVerifier::verify(seed, nonce, identity, 4);
-        (void)result; // Just verify it doesn't crash
+        (void)result; // Just verify it doesn't crash for now
     }
 }

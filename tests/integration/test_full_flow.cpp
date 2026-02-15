@@ -28,6 +28,7 @@ protected:
     void SetUp() override {
         config.secret_salt = "test_salt";
         config.admin_token = "admin_secret";
+        redis.set_blocking_executor(ioc.get_executor());
     }
     std::shared_ptr<WebSocketSession> create_session() {
         auto session = std::make_shared<WebSocketSession>(
@@ -120,11 +121,4 @@ TEST_F(FullFlowTest, LinkPreviewFlow) {
     EXPECT_EQ(res["status"], "proxied");
     EXPECT_EQ(res["title"], "github.com");
 }
-TEST_F(FullFlowTest, MulticastFlow) {
-    auto sender = create_session();
-    std::vector<std::string> recipients = { std::string(64, '1'), std::string(64, '2') };
-    json::object msg;
-    msg["type"] = "multicast";
-    msg["body"] = "Mass ping";
-    relay.relay_multicast(recipients, json::serialize(msg));
-}
+

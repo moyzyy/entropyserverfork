@@ -20,12 +20,3 @@ If you discover a potential security flaw in Entropy, please report it responsib
 *   We believe in "Security for Everyone"—we will not initiate legal action against researchers who act in good faith and follow this policy.
 
 ---
-
-## Technical Security Note
-
-Entropy is designed for high-concurrency, metadata-protected environments. If you find a way to:
-1. De-blind user identifiers without the server salt.
-2. Defeat the token-bucket rate limiting via packet manipulation.
-3. Cause a crash in the `Boost.Asio` hot-path.
-
-These are considered high-priority issues and will be addressed immediately.

@@ -11,30 +11,26 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    message(STATUS "Setting build type to 'Debug' as none was specified.")
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Choose the type of build." FORCE)
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(
+        -O3
+        -march=native
+        -flto
         -fstack-protector-strong
         -D_FORTIFY_SOURCE=2
-        -O3
+        -fno-plt
+        -fno-rtti
+        -DENTROPY_PRODUCTION=1
     )
-    if(CMAKE_BUILD_TYPE STREQUAL "Release")
-         add_definitions(-DENTROPY_PRODUCTION=1)
-    endif()
-endif()
-
-option(USE_ASAN "Enable AddressSanitizer" OFF)
-option(USE_TSAN "Enable ThreadSanitizer" OFF)
-
-if(USE_ASAN)
-    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-    add_link_options(-fsanitize=address)
-    message(STATUS "AddressSanitizer enabled")
-endif()
-
-if(USE_TSAN)
-    add_compile_options(-fsanitize=thread)
-    add_link_options(-fsanitize=thread)
-    message(STATUS "ThreadSanitizer enabled")
+    add_link_options(-Wl,-O1 -Wl,--as-needed -flto -Wl,--strip-all)
+else()
+    # Development/Debug build
+    # We apply warnings to our targets specifically to avoid breaking 3rd party headers
 endif()
 
 
@@ -126,6 +122,10 @@ target_include_directories(server_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include/handlers
 )
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(server_core PRIVATE -g -O0 -Wall -Wextra)
+endif()
 
 target_link_libraries(server_core PUBLIC
     Boost::system

@@ -20,7 +20,6 @@ namespace entropy {
 
 
     /**
-     * WebSocketSession Constructor (TLS Transport).
      * Configures the secure stream with optimized timeouts, keep-alive pacing, and compression.
      */
     WebSocketSession::WebSocketSession(
@@ -44,7 +43,7 @@ namespace entropy {
     auto& tls_ws = std::get<websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(ws_);
     
     websocket::stream_base::timeout opt{};
-    opt.handshake_timeout = std::chrono::seconds(15);
+    opt.handshake_timeout = std::chrono::seconds(5);
     opt.idle_timeout = std::chrono::seconds(300);
     opt.keep_alive_pings = true;                   
     tls_ws.set_option(opt);
@@ -56,10 +55,13 @@ namespace entropy {
     pmd.client_enable = true;
     tls_ws.set_option(pmd);
     tls_ws.read_message_max(config_.max_message_size); 
+    read_buffer_.max_size(config_.max_message_size);
     last_activity_time_ = std::chrono::steady_clock::now();
+    last_pacing_time_ = last_activity_time_;    
+    blinded_ip_ = conn_manager_.blind_id(remote_addr_);
+    update_next_dummy_time();
 }
 
-// Plaintext WebSocket Constructor (fallback or behind reverse-proxy)
 WebSocketSession::WebSocketSession(
     beast::tcp_stream&& stream,
     ConnectionManager& conn_manager,
@@ -81,7 +83,7 @@ WebSocketSession::WebSocketSession(
     auto& plain_ws = std::get<websocket::stream<beast::tcp_stream>>(ws_);
     
     websocket::stream_base::timeout opt{};
-    opt.handshake_timeout = std::chrono::seconds(15);
+    opt.handshake_timeout = std::chrono::seconds(5);
     opt.idle_timeout = std::chrono::seconds(300);  
     opt.keep_alive_pings = true;                   
     plain_ws.set_option(opt);
@@ -95,11 +97,43 @@ WebSocketSession::WebSocketSession(
     plain_ws.set_option(pmd);
     
     plain_ws.read_message_max(config_.max_message_size); 
+    read_buffer_.max_size(config_.max_message_size);
     last_activity_time_ = std::chrono::steady_clock::now();
+    last_pacing_time_ = last_activity_time_;
+    
+    blinded_ip_ = conn_manager_.blind_id(remote_addr_);
+    update_next_dummy_time();
 }
 
 WebSocketSession::~WebSocketSession() {
     trigger_close_handler();
+}
+
+void WebSocketSession::update_next_dummy_time() {
+    static thread_local std::mt19937 gen{std::random_device{}()};
+    std::uniform_int_distribution<> dis(config_.dummy.min_interval_s, config_.dummy.max_interval_s);
+    auto delay = std::chrono::seconds(dis(gen));
+    next_dummy_time_ = std::chrono::steady_clock::now() + delay;
+}
+
+void WebSocketSession::check_dummy_traffic() {
+    if (!config_.dummy.enabled || close_triggered_) return;
+    
+    auto now = std::chrono::steady_clock::now();
+    
+    if (now >= next_dummy_time_) {
+        static const std::string DUMMY_TYPE = "dummy_random";
+        json::object dummy_msg;
+        dummy_msg["type"] = DUMMY_TYPE;
+        dummy_msg["ts"] = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        
+        std::string payload = json::serialize(dummy_msg);
+        TrafficNormalizer::pad_serialized_json(payload, config_.pacing.packet_size);
+        
+        send_text(std::move(payload), false);
+        
+        update_next_dummy_time();
+    }
 }
 
 // Utility to get the appropriate executor from the variant stream
@@ -146,12 +180,20 @@ template void WebSocketSession::accept<http::string_body, std::allocator<char>>(
     std::function<void(beast::error_code)> on_accept
 );
 
-void WebSocketSession::run() {
-    start_pacing();
-    do_read();
+void WebSocketSession::set_user_data(std::string_view data) {
+    user_data_ = data;
+    if (!user_data_.empty()) {
+        blinded_user_id_ = conn_manager_.blind_id(user_data_);
+    } else {
+        blinded_user_id_.clear();
+    }
 }
 
-// Async read loop
+void WebSocketSession::run() {
+    do_read(); 
+}
+
+
 void WebSocketSession::do_read() {
     auto self = shared_from_this();
     
@@ -172,7 +214,6 @@ void WebSocketSession::do_read() {
     }
 }
 
-// Process incoming WebSocket messages
 void WebSocketSession::on_read(beast::error_code ec, std::size_t bytes_transferred) {
     last_activity_time_ = std::chrono::steady_clock::now();
     
@@ -192,49 +233,117 @@ void WebSocketSession::on_read(beast::error_code ec, std::size_t bytes_transferr
     
     std::string message = beast::buffers_to_string(beast::buffers_prefix(bytes_transferred, read_buffer_.data()));
     
-    // Check if the message was received as binary or text
     bool is_binary = false;
     if (is_tls_) {
-        is_binary = std::get<websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(ws_)
-            .got_binary();
+        is_binary = std::get<websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(ws_).got_binary();
     } else {
-        is_binary = std::get<websocket::stream<beast::tcp_stream>>(ws_)
-            .got_binary();
+        is_binary = std::get<websocket::stream<beast::tcp_stream>>(ws_).got_binary();
     }
     
     read_buffer_.consume(bytes_transferred);
     
-    // Route to higher-level message handler
+    // Enforce padded packet sizes
+    if (bytes_transferred % config_.pacing.packet_size != 0) {
+        SecurityLogger::log(SecurityLogger::Level::WARNING, 
+                           SecurityLogger::EventType::INVALID_INPUT,
+                           remote_addr_, 
+                           "Rejecting unpadded inbound packet: size=" + std::to_string(bytes_transferred));
+        trigger_close_handler();
+        return;
+    }
+    
     if (on_message_) {
-        on_message_(shared_from_this(), message, is_binary);
+        on_message_(shared_from_this(), std::move(message), is_binary);
     }
     
     do_read();
+    
+    // Aggressive Memory Management: Shrink buffer if it's holding onto too much memory
+    if (read_buffer_.capacity() > 8192) {
+        read_buffer_.shrink_to_fit();
+    }
 }
 
-// Enqueue text message for asynchronous delivery
-void WebSocketSession::send_text(const std::string& message, bool is_media) {
-    auto msg_data = std::make_shared<std::string>(message);
+void WebSocketSession::send_text(std::string message, bool is_media) {
+    auto msg_data = std::make_shared<std::string>(std::move(message));
+    size_t msg_size = msg_data->size();
     
     net::post(
         get_executor(),
-        [self = shared_from_this(), msg_data, is_media, this]() {
-            write_queue_.push({msg_data, false, is_media});
+        [self = shared_from_this(), msg_data, is_media, msg_size]() {
+            if (self->is_queue_full(msg_size)) {
+                SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::RATE_LIMIT_HIT, self->remote_addr_, "Outbound queue full. Dropping message.");
+                return;
+            }
+            
+            auto now = std::chrono::steady_clock::now();
+            if (self->last_pacing_time_ < now) self->last_pacing_time_ = now;
+            
+            // Apply Micro-Pacing Jitter (10-50ms) to flatten burst spikes
+            static thread_local std::mt19937 gen{std::random_device{}()};
+            std::uniform_int_distribution<int> jitter_dis(10, 50);
+            
+            if (!is_media) {
+                self->last_pacing_time_ += std::chrono::milliseconds(self->config_.pacing.tick_interval_ms + jitter_dis(gen));
+            } else {
+                self->last_pacing_time_ += std::chrono::milliseconds(jitter_dis(gen));
+            }
+            
+            self->pacing_queue_.push_back({msg_data, false, is_media, self->last_pacing_time_});
+            self->current_queue_bytes_ += msg_size;
+
         });
 }
 
-// Enqueue binary message for asynchronous delivery
-void WebSocketSession::send_binary(const std::string& data, bool is_media) {
-    auto msg_data = std::make_shared<std::string>(data);
+void WebSocketSession::send_binary(std::string data, bool is_media) {
+    auto msg_data = std::make_shared<std::string>(std::move(data));
+    size_t msg_size = msg_data->size();
     
     net::post(
         get_executor(),
-        [self = shared_from_this(), msg_data, is_media, this]() {
-            write_queue_.push({msg_data, true, is_media});
+        [self = shared_from_this(), msg_data, is_media, msg_size]() {
+            if (self->is_queue_full(msg_size)) {
+                SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::RATE_LIMIT_HIT, self->remote_addr_, "Outbound binary queue full. Dropping message.");
+                return;
+            }
+            
+            auto now = std::chrono::steady_clock::now();
+            if (self->last_pacing_time_ < now) self->last_pacing_time_ = now;
+            
+            static thread_local std::mt19937 gen{std::random_device{}()};
+            std::uniform_int_distribution<int> jitter_dis(10, 50);
+
+            if (!is_media) {
+                self->last_pacing_time_ += std::chrono::milliseconds(self->config_.pacing.tick_interval_ms + jitter_dis(gen));
+            } else {
+                self->last_pacing_time_ += std::chrono::milliseconds(jitter_dis(gen));
+            }
+            
+            self->pacing_queue_.push_back({msg_data, true, is_media, self->last_pacing_time_});
+            self->current_queue_bytes_ += msg_size;
         });
 }
 
-// Async write loop
+void WebSocketSession::flush_pacing_queue() {
+    auto now = std::chrono::steady_clock::now();
+    bool should_write = false;
+    
+    // Batch move all "mature" messages to the active write queue
+    for (auto it = pacing_queue_.begin(); it != pacing_queue_.end(); ) {
+        if (now >= it->ready_time) {
+            write_queue_.push(std::move(*it));
+            it = pacing_queue_.erase(it);
+            should_write = true;
+        } else {
+            ++it;
+        }
+    }
+    
+    if (should_write) {
+        do_write();
+    }
+}
+
 void WebSocketSession::do_write() {
     if (write_queue_.empty() || is_writing_) {
         return;
@@ -243,6 +352,7 @@ void WebSocketSession::do_write() {
     is_writing_ = true;
     auto item = write_queue_.front();
     write_queue_.pop();
+    if (item.data) current_queue_bytes_ -= item.data->size();
     
     auto self = shared_from_this();
     const bool was_media = item.is_media;
@@ -252,18 +362,16 @@ void WebSocketSession::do_write() {
         ws.binary(item.is_binary);
         ws.async_write(
             net::buffer(*item.data),
-            [self, item, was_media](beast::error_code ec, std::size_t bytes) {
+            [self, item](beast::error_code ec, std::size_t bytes) {
                 self->on_write(ec, bytes);
-                self->last_was_media_ = was_media;
             });
     } else {
         auto& ws = std::get<websocket::stream<beast::tcp_stream>>(ws_);
         ws.binary(item.is_binary);
         ws.async_write(
             net::buffer(*item.data),
-            [self, item, was_media](beast::error_code ec, std::size_t bytes) {
+            [self, item](beast::error_code ec, std::size_t bytes) {
                 self->on_write(ec, bytes);
-                self->last_was_media_ = was_media;
             });
     }
     last_activity_time_ = std::chrono::steady_clock::now();
@@ -281,18 +389,11 @@ void WebSocketSession::on_write(beast::error_code ec, std::size_t  ) {
         return;
     }
 
-    // Try to send next message immediately if available
     do_write();
 }
 
 void WebSocketSession::close() {
     if (close_triggered_.exchange(true)) return;
-    
-    if (pacing_timer_) {
-        beast::error_code ec;
-        pacing_timer_->cancel(ec);
-    }
-    
     do_close();
 }
 
@@ -327,42 +428,6 @@ void WebSocketSession::do_close() {
             });
     }
 }
-
-    void WebSocketSession::start_pacing() {
-        pacing_timer_ = std::make_shared<net::steady_timer>(get_executor());
-        tick_pacing();
-    }
-
-    /**
-     * Executes the periodic Pacing loop for traffic normalization.
-     * Injects dummy packets when no legitimate traffic is queued to obscure communication metadata.
-     */
-    void WebSocketSession::tick_pacing() {
-        if (close_triggered_) return;
-        
-        auto self = shared_from_this();
-        int current_interval = last_was_media_ ? 10 : ServerConfig::Pacing::tick_interval_ms;
-
-        pacing_timer_->expires_after(std::chrono::milliseconds(current_interval));
-        pacing_timer_->async_wait([self, this](beast::error_code ec) {
-            if (ec || close_triggered_) return;
-            
-            net::post(get_executor(), [self, this]() {
-                if (close_triggered_) return;
-
-                if (write_queue_.empty()) {
-                    json::object dummy;
-                    dummy["type"] = "dummy_pacing";
-                    TrafficNormalizer::pad_json(dummy, ServerConfig::Pacing::packet_size);
-                    write_queue_.push(QueuedMessage{std::make_shared<std::string>(json::serialize(dummy)), false, false});
-                    last_was_media_ = false;
-                }
-                
-                do_write();
-                tick_pacing();
-            });
-        });
-    }
 
 
 }

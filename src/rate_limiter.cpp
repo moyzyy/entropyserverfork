@@ -8,7 +8,6 @@ RateLimiter::RateLimiter(RedisManager& redis)
     : redis_(redis)
 {}
 
-// Sliding window rate limit check.
 RateLimitResult RateLimiter::check(const std::string& key, int limit, int window_sec, int cost) {
     return redis_.rate_limit(key, limit, window_sec, cost);
 }

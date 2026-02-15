@@ -1,5 +1,0 @@
-if(EXISTS "/home/moyzy/projects/entropy/server/build_asan/tests/entropy_tests[1]_tests.cmake")
-  include("/home/moyzy/projects/entropy/server/build_asan/tests/entropy_tests[1]_tests.cmake")
-else()
-  add_test(entropy_tests_NOT_BUILT entropy_tests_NOT_BUILT)
-endif()

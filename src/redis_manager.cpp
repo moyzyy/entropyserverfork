@@ -4,6 +4,7 @@
 #include "challenge.hpp"
 #include "security_logger.hpp"
 #include <openssl/crypto.h>
+#include <openssl/hmac.h>
 #include <iostream>
 #include <chrono>
 #include <iterator>
@@ -11,36 +12,24 @@
 
 namespace entropy {
 
-    /**
-     * RedisManager Constructor.
-     * Establishes connection to the Redis cluster and configures "Quiet Persistence"
-     * to minimize forensic metadata footprints on disk.
-     */
     RedisManager::RedisManager(const ServerConfig& config, ConnectionManager& conn_manager, const std::string& salt)
-    : conn_manager_(conn_manager), server_salt_(salt) {
+    : conn_manager_(conn_manager), server_salt_(salt), offline_msg_limit_(config.offline_msg_limit) {
         try {
             redis_ = std::make_unique<sw::redis::Redis>(config.redis_url);
             connected_ = true;
             
             try {
-                // Configure 15-minute snapshot intervals and disable AOF to maximize privacy and performance.
                 redis_->command("CONFIG", "SET", "save", "900 1"); 
                 redis_->command("CONFIG", "SET", "appendonly", "no"); 
-                redis_->command("CONFIG", "SET", "maxmemory-policy", "noeviction");
+                redis_->command("CONFIG", "SET", "maxmemory-policy", "allkeys-lru");
+                redis_->command("CONFIG", "SET", "maxmemory", "256mb"); 
             } catch (...) {}
-            
-            running_ = true;
-            subscriber_thread_ = std::thread(&RedisManager::subscriber_loop, this);
         } catch (const std::exception& e) {
             SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis connection failed: " + std::string(e.what()));
             connected_ = false;
         }
     }
 
-    /**
-     * Executes an atomic Generic Cell Rate Algorithm (GCRA) for rate-limiting.
-     * Integrates temporary "jail" state for repeat violators to mitigate DDoS/Brute-force.
-     */
     RateLimitResult RedisManager::rate_limit(const std::string& key, int limit, int period_sec, int cost) {
         RateLimitResult result = {true, (long long)0, (long long)limit, 0};
         if (!connected_) return result; 
@@ -134,102 +123,16 @@ namespace entropy {
 }
 
 RedisManager::~RedisManager() {
-    running_ = false;
-    if (subscriber_thread_.joinable()) {
-        subscriber_thread_.join();
-    }
 }
 
-// Publishes a message to a specific relay channel. Used for cross-instance delivery.
-void RedisManager::publish_message(const std::string& recipient_hash, const std::string& message_json) {
-    if (!connected_) return;
-    try {
-        std::string blinded = blind(recipient_hash);
-        std::string channel = "relay:" + blinded;
-        redis_->publish(channel, message_json);
-    } catch (const std::exception& e) {
-        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis publish failed: " + std::string(e.what()));
-    }
-}
 
-void RedisManager::publish_multicast(const std::vector<std::string>& recipients, const std::string& message_json) {
-    if (!connected_) return;
-    for (const auto& r : recipients) {
-        publish_message(r, message_json);
-    }
-}
-
-void RedisManager::subscribe_user(const std::string& user_hash) {
-    if (!connected_) return;
-    std::string blinded = blind(user_hash);
-    std::lock_guard<std::mutex> lock(subscriber_mutex_);
-    if (subscriber_) {
-        subscriber_->subscribe("relay:" + blinded);
-    }
-}
-
-void RedisManager::unsubscribe_user(const std::string& user_hash) {
-    if (!connected_) return;
-    std::string blinded = blind(user_hash);
-    std::lock_guard<std::mutex> lock(subscriber_mutex_);
-    if (subscriber_) {
-        subscriber_->unsubscribe("relay:" + blinded);
-    }
-}
-
-// Subscriber loop responsible for processing messages from the Redis cluster.
-void RedisManager::subscriber_loop() {
-    if (!connected_) return;
-
-    while (running_) {
-        try {
-            {
-                std::lock_guard<std::mutex> lock(subscriber_mutex_);
-                subscriber_ = std::make_unique<sw::redis::Subscriber>(redis_->subscriber());
-                
-                subscriber_->on_message([this](std::string channel, std::string msg) {
-                    if (channel.rfind("relay:", 0) == 0) {
-                        std::string blinded_id = channel.substr(6);
-                        conn_manager_.process_distributed_message_for_blinded_id(blinded_id, msg);
-                    }
-                });
-            }
-
-            while (running_) {
-                try {
-                    bool has_subscriber = false;
-                    {
-                        std::lock_guard<std::mutex> lock(subscriber_mutex_);
-                        has_subscriber = (subscriber_ != nullptr);
-                    }
-                    if (has_subscriber) {
-                        subscriber_->consume();
-                    } else {
-                        break; 
-                    }
-                } catch (const sw::redis::TimeoutError &e) {
-                    continue;
-                } catch (const std::exception &e) {
-                    throw; 
-                }
-            }
-        } catch (const std::exception& e) {
-            if (running_) {
-                SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY, "internal", "Redis subscriber error (reconnecting...): " + std::string(e.what()));
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-            }
-        }
-    }
-}
-
-// Stores a message in a FIFO list for offline recipients (24h TTL).
 bool RedisManager::store_offline_message(const std::string& user_hash, const std::string& message_json) {
     if (!connected_) return false;
     try {
         std::string blinded = blind(user_hash);
         std::string key = "msg:" + blinded;
         redis_->rpush(key, message_json);
-        redis_->ltrim(key, -100, -1); // Limit of 100 queued messages per user
+        redis_->ltrim(key, -((int)offline_msg_limit_), -1); 
         redis_->expire(key, 86400);   // Messages expire after 24 hours
         return true;
     } catch (const std::exception& e) {
@@ -238,7 +141,6 @@ bool RedisManager::store_offline_message(const std::string& user_hash, const std
     }
 }
 
-// Atomically retrieves and deletes all offline messages for a specific recipient.
 std::vector<std::string> RedisManager::retrieve_offline_messages(const std::string& user_hash) {
     std::vector<std::string> messages;
     if (!connected_) return messages;
@@ -264,7 +166,6 @@ std::vector<std::string> RedisManager::retrieve_offline_messages(const std::stri
     return messages;
 }
 
-// Stores a user's cryptographic identity bundle.
 bool RedisManager::store_user_bundle(const std::string& user_hash, const std::string& bundle_json) {
     if (!connected_) return false;
     try {
@@ -299,7 +200,6 @@ std::string RedisManager::get_user_bundle(const std::string& user_hash) {
     return "";
 }
 
-// Returns random user hashes for decoy traffic generation.
 std::vector<std::string> RedisManager::get_random_user_hashes(int count) {
     std::vector<std::string> hashes;
     if (!connected_) return hashes;
@@ -309,7 +209,6 @@ std::vector<std::string> RedisManager::get_random_user_hashes(int count) {
     return hashes;
 }
 
-// Maps a human-readable nickname to a cryptographic public key hash.
 bool RedisManager::register_nickname(const std::string& nickname, const std::string& user_hash) {
     if (!connected_ || nickname.empty()) return false;
     try {
@@ -318,7 +217,6 @@ bool RedisManager::register_nickname(const std::string& nickname, const std::str
         // Use NX (Not Exists) to ensure nickname uniqueness
         bool success = redis_->set(key, user_hash, std::chrono::seconds(2592000), sw::redis::UpdateType::NOT_EXIST);
         if (!success) {
-            // If already owned by the same hash, just update the TTL
             auto val = redis_->get(key);
             if (val && *val == user_hash) {
                 redis_->expire(key, 2592000); 
@@ -328,11 +226,9 @@ bool RedisManager::register_nickname(const std::string& nickname, const std::str
         }
         redis_->expire(key, 2592000); 
         
-        // Create an event key to track registration intensity (for dynamic PoW adjustments)
         std::string event_id = ::entropy::ChallengeGenerator::generate_seed().substr(0, 8);
         redis_->set("reg_event:" + event_id, "1", std::chrono::seconds(300)); 
         
-        // Store reverse mapping for clean account deletion
         redis_->set("rn:" + blind(user_hash), nickname, std::chrono::seconds(2592000), sw::redis::UpdateType::NOT_EXIST);
 
         return true;
@@ -343,7 +239,6 @@ bool RedisManager::register_nickname(const std::string& nickname, const std::str
     }
 }
 
-// Calculates recent registration frequency to adjust Anti-Spam (PoW) costs.
 int RedisManager::get_registration_intensity() {
     if (!connected_) return 0;
     try {
@@ -448,7 +343,6 @@ bool RedisManager::verify_session_token(const std::string& user_hash, const std:
     }
 }
 
-// Irreversibly purges all data associated with a public key hash from Redis.
 bool RedisManager::burn_account(const std::string& user_hash) {
     if (!connected_) return false;
     try {
@@ -459,8 +353,6 @@ bool RedisManager::burn_account(const std::string& user_hash) {
         redis_->del("msg:" + blinded);
         redis_->del("sess:" + blinded);
         redis_->del("seen:" + blinded);
-
-        // Remove linked nicknames
         auto nick_val = redis_->get("rn:" + blinded);
         if (nick_val) {
              std::string nick = *nick_val;
@@ -478,17 +370,22 @@ bool RedisManager::burn_account(const std::string& user_hash) {
     }
 }
 
-// Blind an identifier using the server's secret salt.
 std::string RedisManager::blind(const std::string& input) {
-    std::string data = input + server_salt_;
+    unsigned int len = SHA256_DIGEST_LENGTH;
     unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256(reinterpret_cast<const unsigned char*>(data.c_str()), data.size(), hash);
     
-    std::stringstream ss;
+    HMAC(EVP_sha256(), server_salt_.c_str(), server_salt_.size(), 
+         reinterpret_cast<const unsigned char*>(input.c_str()), input.size(), 
+         hash, &len);
+    
+    static const char hex_chars[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(SHA256_DIGEST_LENGTH * 2);
     for(int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+        result.push_back(hex_chars[hash[i] >> 4]);
+        result.push_back(hex_chars[hash[i] & 0x0F]);
     }
-    return ss.str();
+    return result;
 }
 
 bool RedisManager::delete_key(const std::string& key) {

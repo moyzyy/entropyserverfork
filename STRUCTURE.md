@@ -5,28 +5,32 @@ Summary of the Entropy Relay Server codebase organization.
 ```text
 .
 ├── include/                 # Header Files (.hpp)
-│   ├── handlers/            # REST & WS endpoint logic
-│   ├── http_session.hpp     # REST API handler
-│   ├── websocket_session.hpp# WebSocket state machine
-│   ├── connection_manager.hpp# Active client tracking
-│   ├── redis_manager.hpp    # Database abstraction
-│   ├── security_logger.hpp  # Blinded auditing
-│   └── rate_limiter.hpp     # DoS protection
+│   ├── handlers/            # REST & WS endpoint logic (Health, Identity)
+│   ├── http_session.hpp     # REST & WebSocket upgrade handler
+│   ├── websocket_session.hpp# WebSocket state machine & Pacing
+│   ├── connection_manager.hpp# Active client & IP tracking
+│   ├── redis_manager.hpp    # Redis storage & Pub/Sub
+│   ├── input_validator.hpp  # Crypto & JSON sanitization
+│   ├── pow_verifier.hpp     # SHA256 challenge logic
+│   ├── traffic_normalizer.hpp# JSON padding utilities
+│   ├── metrics.hpp          # Prometheus/Gauge registry
+│   └── rate_limiter.hpp     # DoS protection (GCRA)
 │
 ├── src/                     # Implementation (.cpp)
-│   ├── main.cpp             # Entry point, SSL & Thread Pool setup
-│   ├── message_relay.cpp    # Routing logic
-│   ├── pow_verifier.cpp     # SHA256 challenge math
-│   └── ...                  # Implementations for headers
+│   ├── main.cpp             # Entry point & SSL Setup
+│   ├── message_relay.cpp    # Routing & Jitter logic
+│   ├── redis_manager.cpp    # Lua scripting & Redis I/O
+│   ├── http_session.cpp     # HTTP Route table
+│   └── handlers/            # Endpoint implementation
 │
-├── tests/                   # C++ Unit & Integration Tests
-│   ├── test_main.cpp
-│   └── test_*.cpp           # Component tests
+├── tests/                   # Test Suite
+│   ├── unit/                # Component logic tests
+│   ├── integration/         # Multi-component flows
+│   └── security/            # DoS, Crypto, and Audit tests
 │
+├── scripts/                 # Utility scripts (Certs, etc.)
 ├── cmake/                   # Build system modules
 ├── Dockerfile               # Containerization
-├── docker-compose.yml       # Dev/Prod deployment orchestrator
-├── README.md                # Quickstart
 ├── SPECS.md                 # Architecture & Protocols
 └── API.md                   # Endpoint documentation
 ```
@@ -34,7 +38,8 @@ Summary of the Entropy Relay Server codebase organization.
 ## 🏗️ Execution Flow
 
 1.  **Listener**: Accepts raw TCP connections and performs the TLS handshake.
-2.  **HTTP Session**: Detects if the request is a REST call or a WebSocket upgrade.
-3.  **WebSocket Session**: Upgrades the connection and begins the "Wait for Auth" lifecycle.
-4.  **Connection Manager**: Maintains a thread-safe registry of all active connections, mapping `ID_HASH` -> `session_handle`.
-5.  **Redis Manager**: Facilitates communication between nodes in a cluster and manages volatile data storage (keys, offline messages).
+2.  **HTTP Session**: Dispatches REST calls or negotiates the WebSocket upgrade.
+3.  **WebSocket Session**: Manages the connection lifecycle, including **Traffic Pacing** (dummy packets).
+4.  **Identity Handler**: Processes PoW challenges, key uploads, and nickname registrations.
+5.  **Message Relay**: Handles the routing, jittering, and normalization of encrypted envelopes.
+6.  **Redis Manager**: Manages offline message queues, nickname registry, and persistent state.

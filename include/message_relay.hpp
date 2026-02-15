@@ -15,50 +15,32 @@ namespace entropy {
 
 class WebSocketSession;
 
- 
-// Routes messages between local sessions and remote nodes.
 class MessageRelay {
 public:
-    static constexpr size_t MAX_MESSAGE_SIZE = 5 * 1024 * 1024; // 5MB Limit per relay
-    
+    static constexpr size_t MAX_MESSAGE_SIZE = 128 * 1024; // 128KB Limit
     explicit MessageRelay(ConnectionManager& conn_manager, RedisManager& redis, RateLimiter& rate_limiter, const ServerConfig& config);
     ~MessageRelay() = default;
     
+    void relay_message(std::string_view message_json, 
+                       std::shared_ptr<WebSocketSession> sender);
 
-    
-
-    
-    // --- Message Distribution ---
-    /**
-     * Relays a JSON message to its destination(s).
-     * If recipient is local, it's delivered directly. Otherwise, it's published to Redis.
-     */
-    void relay_message(const std::string& message_json, 
+    void relay_message(const json::object& obj,
                        std::shared_ptr<WebSocketSession> sender);
     
-    void relay_binary(const std::string& recipient_hash,
+    void relay_binary(std::string_view recipient_hash,
                       const void* data, 
                       size_t length,
                       std::shared_ptr<WebSocketSession> sender);
 
-    void relay_volatile(const std::string& recipient_hash,
+    void relay_volatile(std::string_view recipient_hash,
                         const void* data,
                         size_t length,
-                        std::shared_ptr<WebSocketSession> sender = nullptr);
+                        std::shared_ptr<WebSocketSession> sender);
 
-    void relay_multicast(const std::vector<std::string>& recipients,
-                         const std::string& message_json);
-
-    void relay_group_message(const boost::json::array& targets,
-                            std::shared_ptr<WebSocketSession> sender);
-    
     void handle_dummy(std::shared_ptr<WebSocketSession> sender);
 
     void deliver_pending(const std::string& recipient_hash,
                          std::shared_ptr<WebSocketSession> recipient);
-
-    void subscribe_user(const std::string& user_hash) { redis_.subscribe_user(user_hash); }
-    void unsubscribe_user(const std::string& user_hash) { redis_.unsubscribe_user(user_hash); }
 
     void confirm_delivery(const std::vector<int64_t>& /*ids*/) {}
     
@@ -78,7 +60,7 @@ private:
         bool valid;
     };
     
-    RoutingInfo extract_routing(const std::string& message_json);
+    RoutingInfo extract_routing(std::string_view message_json);
 };
 
 }

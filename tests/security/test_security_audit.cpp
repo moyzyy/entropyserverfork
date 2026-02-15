@@ -33,6 +33,7 @@ protected:
         config.admin_token = "prod_admin_secret";
         config.secret_salt = "audit_salt";
         MetricsRegistry::instance().reset();
+        redis.set_blocking_executor(ioc.get_executor());
     }
 };
 TEST_F(SecurityAuditTest, MetricsIntegrity) {

@@ -45,10 +45,6 @@ http::response<http::string_body> HealthHandler::handle_stats(const http::reques
 }
 
 http::response<http::string_body> HealthHandler::handle_metrics(unsigned version) {
-    // Note: handle_metrics doesn't have access to the full request in its current signature
-    // but handle_stats does. To be consistent, let's keep it simple for now or change the signature.
-    // Actually handle_metrics is often called by Prometheus without headers unless configured.
-    // For Production Auditor, we'll assume it needs protection.
     
     std::string body = MetricsRegistry::instance().collect_prometheus();
     

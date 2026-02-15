@@ -21,10 +21,6 @@ namespace entropy {
 
 
 
-    /**
-     * HTTPS Session state (TLS transport).
-     * Initializes the encrypted stream and extracts the peer identity for logging.
-     */
     HttpSession::HttpSession(
         beast::ssl_stream<beast::tcp_stream>&& stream,
         const ServerConfig& config,
@@ -33,6 +29,8 @@ namespace entropy {
         RateLimiter& rate_limiter,
         KeyStorage& key_storage,
         RedisManager& redis,
+        std::shared_ptr<HealthHandler> health_handler,
+        std::shared_ptr<IdentityHandler> identity_handler,
         std::shared_ptr<void> conn_guard
     )
     : stream_(std::move(stream))
@@ -43,8 +41,8 @@ namespace entropy {
     , rate_limiter_(rate_limiter)
     , key_storage_(key_storage)
     , redis_(redis)
-    , health_handler_(std::make_shared<HealthHandler>(config, conn_manager))
-    , identity_handler_(std::make_shared<IdentityHandler>(config, key_storage, redis, rate_limiter))
+    , health_handler_(health_handler)
+    , identity_handler_(identity_handler)
     , conn_guard_(std::move(conn_guard))
 {
     try {
@@ -56,7 +54,6 @@ namespace entropy {
     }
 }
 
-// Plaintext HTTP Session state (usually behind a local proxy or for testing)
 HttpSession::HttpSession(
     beast::tcp_stream&& stream,
     const ServerConfig& config,
@@ -65,6 +62,8 @@ HttpSession::HttpSession(
     RateLimiter& rate_limiter,
     KeyStorage& key_storage,
     RedisManager& redis,
+    std::shared_ptr<HealthHandler> health_handler,
+    std::shared_ptr<IdentityHandler> identity_handler,
     std::shared_ptr<void> conn_guard
 )
     : stream_(std::move(stream))
@@ -75,8 +74,8 @@ HttpSession::HttpSession(
     , rate_limiter_(rate_limiter)
     , key_storage_(key_storage)
     , redis_(redis)
-    , health_handler_(std::make_shared<HealthHandler>(config, conn_manager))
-    , identity_handler_(std::make_shared<IdentityHandler>(config, key_storage, redis, rate_limiter))
+    , health_handler_(health_handler)
+    , identity_handler_(identity_handler)
     , conn_guard_(std::move(conn_guard))
 {
     try {
@@ -85,6 +84,14 @@ HttpSession::HttpSession(
         remote_addr_ = ep.address().to_string();
     } catch (...) {
         remote_addr_ = "unknown";
+    }
+}
+
+net::any_io_executor HttpSession::get_executor() {
+    if (is_tls_) {
+        return std::get<beast::ssl_stream<beast::tcp_stream>>(stream_).get_executor();
+    } else {
+        return std::get<beast::tcp_stream>(stream_).get_executor();
     }
 }
 
@@ -103,7 +110,6 @@ void HttpSession::run() {
 
 void HttpSession::on_handshake(beast::error_code ec) {
     if (ec) {
-        // Silent closure on handshake failure to prevent resource exhaustion from scanners
         return;
     }
     do_read();
@@ -139,13 +145,20 @@ void HttpSession::on_read(beast::error_code ec, std::size_t  ) {
     req_ = parser_->release();
     
     std::string b_ip = blind_ip(remote_addr_);
-    auto limit_res = rate_limiter_.check("global:" + b_ip, config_.global_rate_limit, 10);
-    if (!limit_res.allowed) {
-        send_response(handle_rate_limited(limit_res));
-        return;
-    }
+    auto self = shared_from_this();
     
-    handle_request();
+    auto exec = redis_.get_blocking_executor();
+    net::post(exec, [self, b_ip]() {
+        auto limit_res = self->rate_limiter_.check("global:" + b_ip, self->config_.global_rate_limit, 10);
+        
+        net::post(self->get_executor(), [self, limit_res]() {
+            if (!limit_res.allowed) {
+                self->send_response(self->handle_rate_limited(limit_res));
+                return;
+            }
+            self->handle_request();
+        });
+    });
 }
 
 void HttpSession::handle_request() {
@@ -184,14 +197,22 @@ void HttpSession::handle_request() {
 }
 
 std::string HttpSession::blind_ip(const std::string& ip) {
-    std::string data = ip + config_.secret_salt;
+    std::string data;
+    data.reserve(ip.size() + config_.secret_salt.size());
+    data += ip;
+    data += config_.secret_salt;
+    
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const unsigned char*>(data.c_str()), data.size(), hash);
-    std::stringstream ss;
+    
+    static const char hex_chars[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(SHA256_DIGEST_LENGTH * 2);
     for(int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+        result.push_back(hex_chars[hash[i] >> 4]);
+        result.push_back(hex_chars[hash[i] & 0x0F]);
     }
-    return ss.str();
+    return result;
 }
 
 // Relays a single message to a target recipient.
@@ -300,7 +321,6 @@ void HttpSession::add_cors_headers(http::response<Body>& res) {
             res.set(http::field::access_control_allow_origin, origin);
             res.set(http::field::access_control_allow_credentials, "true");
         } else if (!config_.allowed_origins.empty()) {
-            // Only log if we have a whitelist and the origin isn't local either
             SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::SUSPICIOUS_ACTIVITY,
                                remote_addr_, "Disallowed origin: " + origin);
         }
@@ -357,7 +377,6 @@ void HttpSession::on_write(bool close, beast::error_code ec, std::size_t  ) {
 }
 
 
-// Transitions the HTTP session to a long-lived WebSocket session.
 void HttpSession::upgrade_to_websocket() {
     std::shared_ptr<WebSocketSession> ws_session;
     
@@ -386,364 +405,365 @@ void HttpSession::upgrade_to_websocket() {
     
     
     size_t max_conns = config_.max_connections_per_ip;
-    size_t max_msg_size = 5 * 1024 * 1024; 
+    size_t max_msg_size = config_.max_message_size;
+    size_t pacing_size = config_.pacing.packet_size;
 
     ws_session->set_message_handler(
-        [relay_ptr, conn_mgr_ptr, rate_limiter_ptr, redis_ptr, identity_handler, key_storage_ptr = &key_storage_, max_conns, max_msg_size](
+        [relay_ptr, conn_mgr_ptr, rate_limiter_ptr, redis_ptr, identity_handler, key_storage_ptr = &key_storage_, max_conns, max_msg_size, pacing_size](
             std::shared_ptr<WebSocketSession> session,
-            const std::string& data,
+            std::string data,
             bool is_binary
         ) {
-            auto b_ip = conn_mgr_ptr->blind_id(session->remote_address());
+            auto& b_ip = session->get_blinded_ip();
             int max_msgs = session->is_authenticated() ? 1000 : 50;
-            auto limit_res = rate_limiter_ptr->check("ws_msg:" + b_ip, max_msgs, 10);
-            if (!limit_res.allowed) {
-                SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::RATE_LIMIT_HIT,
-                                  session->remote_address(), "WebSocket rate limit exceeded");
-                session->close();
-                return;
-            }
 
-            if (data.size() > max_msg_size) {
-                SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::INVALID_INPUT,
-                                  session->remote_address(), "Message exceeds size limit");
-                session->close();
-                return;
-            }
-            
-            if (is_binary) {
-                if (!session->is_challenge_solved()) {
-                    SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::AUTH_FAILURE,
-                                      session->remote_address(), "Unauthenticated binary relay attempt");
-                    session->close();
+            auto exec = redis_ptr->get_blocking_executor();
+            // Process on blocking pool to prevent IO thread starvation and enforce rate limits correctly.
+            net::post(exec, [session, data = std::move(data), is_binary, b_ip, max_msgs, relay_ptr, conn_mgr_ptr, rate_limiter_ptr, redis_ptr, identity_handler, key_storage_ptr, max_conns, max_msg_size, pacing_size]() {
+                auto limit_res = rate_limiter_ptr->check("ws_msg:" + b_ip, max_msgs, 10);
+                if (!limit_res.allowed) {
+                    SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::RATE_LIMIT_HIT,
+                                      session->remote_address(), "WebSocket rate limit exceeded");
+                    net::post(session->get_executor(), [session]() { session->close(); });
                     return;
                 }
-                
-                if (data.size() > 64) {
-                    std::string recipient = data.substr(0, 64);
-                    relay_ptr->relay_binary(
-                        recipient,
-                        data.data() + 64,
-                        data.size() - 64,
-                        session
-                    );
-                }
-                return;
-            }
-            
-            
-            try {
-                auto json_val = InputValidator::safe_parse_json(data);
-                if (!json_val.is_object()) {
+
+                if (data.size() > max_msg_size) {
                     SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::INVALID_INPUT,
-                                      session->remote_address(), "Invalid JSON structure");
+                                      session->remote_address(), "Message exceeds size limit");
+                    net::post(session->get_executor(), [session]() { session->close(); });
                     return;
                 }
                 
-                auto& obj = json_val.as_object();
-                std::string type;
-                if (obj.contains("type")) {
-                    type = std::string(obj["type"].as_string());
-                }
-                
-                
-                if (type == "ping") {
-                    json::object pong;
-                    pong["type"] = "pong";
-                    if (obj.contains("timestamp")) pong["timestamp"] = obj["timestamp"];
-                    TrafficNormalizer::pad_json(pong, 1536);
-                    session->send_text(json::serialize(pong));
-                    return;
-                }
-
-                if (type == "pow_challenge") {
-                    auto res = identity_handler->handle_pow_challenge_ws(obj, session->remote_address());
-                    TrafficNormalizer::pad_json(res, 1536);
-                    session->send_text(json::serialize(res));
-                    return;
-                }
-
-                if (type == "fetch_key_random") {
-                    auto res = identity_handler->handle_keys_random_ws(obj, session->remote_address());
-                    TrafficNormalizer::pad_json(res, 1536);
-                    session->send_text(json::serialize(res));
-                    return;
-                }
-
-                if (type == "keys_upload") {
-                    auto res = identity_handler->handle_keys_upload_ws(obj, session->remote_address());
-                    TrafficNormalizer::pad_json(res, 1536);
-                    session->send_text(json::serialize(res));
-                    return;
-                }
-
-                if (type == "fetch_key") {
-                    auto res = identity_handler->handle_keys_fetch_ws(obj, session->remote_address());
-                    TrafficNormalizer::pad_json(res, 1536);
-                    session->send_text(json::serialize(res));
-                    return;
-                }
-
-                if (type == "nickname_lookup") {
-                    auto res = identity_handler->handle_nickname_lookup_ws(obj, session->remote_address());
-                    TrafficNormalizer::pad_json(res, 1536);
-                    session->send_text(json::serialize(res));
-                    return;
-                }
-
-                if (type == "nickname_register") {
-                    auto res = identity_handler->handle_nickname_register_ws(obj, session->remote_address());
-                    TrafficNormalizer::pad_json(res, 1536);
-                    session->send_text(json::serialize(res));
-                    return;
-                }
-
-                if (type == "account_burn") {
-                    auto res = identity_handler->handle_account_burn_ws(obj, session->remote_address());
-                    TrafficNormalizer::pad_json(res, 1536);
-                    session->send_text(json::serialize(res));
-                    return;
-                }
-
-                if (type == "link_preview") {
-                    auto res = identity_handler->handle_link_preview_ws(obj, session->remote_address());
-                    TrafficNormalizer::pad_json(res, 1536);
-                    session->send_text(json::serialize(res));
-                    return;
-                }
-
-                if (type == "dummy" || type == "dummy_pacing") {
-                    return; 
-                }
-
-                if (type == "auth") {
-                    if (obj.contains("payload")) {
-                        auto& auth_payload = obj["payload"].as_object();
-                        
-                        std::string id_hash;
-                        if (auth_payload.contains("identity_hash")) id_hash = std::string(auth_payload["identity_hash"].as_string());
-                        std::string hash = InputValidator::sanitize_field(id_hash, 256);
-
-                        bool auth_valid = false;
-
-                        
-                        if (auth_payload.contains("session_token") && auth_payload["session_token"].is_string()) {
-                            std::string token = std::string(auth_payload["session_token"].as_string());
-                            if (redis_ptr->verify_session_token(hash, token)) {
-                                auth_valid = true;
-                            }
-                        }
-
-                        
-                        if (!auth_valid) {
-                            std::string seed;
-                            if (auth_payload.contains("seed") && auth_payload["seed"].is_string()) 
-                                seed = std::string(auth_payload["seed"].as_string());
-                            
-                            std::string nonce;
-                            if (auth_payload.contains("nonce")) {
-                                if (auth_payload["nonce"].is_string()) nonce = std::string(auth_payload["nonce"].as_string());
-                                else if (auth_payload["nonce"].is_number()) nonce = std::to_string(auth_payload["nonce"].as_int64());
-                            }
-                            
-                            
-                            int intensity_penalty = 0;
-                            int intensity = redis_ptr->get_registration_intensity();
-                            if (intensity > 10) intensity_penalty = 2;
-                            if (intensity > 50) intensity_penalty = 4;
-                            if (intensity > 200) intensity_penalty = 8;
-                            
-                            long long age = redis_ptr->get_account_age(hash);
-                            int required_difficulty = ::entropy::PoWVerifier::get_required_difficulty(intensity_penalty, age);
-
-                            if (!seed.empty() && !nonce.empty() && rate_limiter_ptr->consume_challenge(seed) && 
-                                ::entropy::PoWVerifier::verify(seed, nonce, hash, required_difficulty)) {
-                                auth_valid = true;
-                            }
-                        }
-
-                        if (!auth_valid || hash.empty()) {
-                             SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::AUTH_FAILURE,
-                                               session->remote_address(), "Authentication failed");
-                             
-                             json::object error;
-                             error["type"] = "error";
-                             error["code"] = "auth_failed";
-                             error["message"] = "Authentication failed. Token may be expired.";
-                             TrafficNormalizer::pad_json(error, 1536);
-                             session->send_text(json::serialize(error));
-                             
-                             session->close();
-                             return;
-                        }
-                      
-                        if (!conn_mgr_ptr->add_connection_with_limit(hash, session, session->remote_address(), max_conns)) {
-                            SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::RATE_LIMIT_HIT,
-                                              session->remote_address(), "Connection limit exceeded for IP");
-                            json::object error;
-                            error["type"] = "error";
-                            error["code"] = "connection_limit";
-                            error["message"] = "Too many connections from your IP address";
-                            TrafficNormalizer::pad_json(error, 1536);
-                            session->send_text(json::serialize(error));
-                            session->close();
-                            return;
-                        }
-                        
-                        session->set_user_data(hash);
-                        session->set_challenge_solved(true);
-                        session->set_authenticated(true);
-                        
-                        relay_ptr->subscribe_user(hash);
-                        
-                        SecurityLogger::log(SecurityLogger::Level::INFO, SecurityLogger::EventType::AUTH_SUCCESS,
-                                          session->remote_address(), "User authenticated");
-
-                        
-                        std::string new_token = redis_ptr->create_session_token(hash, 3600);
-
-                        json::object response;
-                        response["type"] = "auth_success";
-                        response["identity_hash"] = hash;
-                        if (!new_token.empty()) response["session_token"] = new_token;
-                        
-                        
-                        response["keys_missing"] = key_storage_ptr->get_bundle(hash).empty();
-                        
-                        TrafficNormalizer::pad_json(response, 1536);
-                        session->send_text(json::serialize(response));
-                        
-                        relay_ptr->deliver_pending(hash, session);
+                if (is_binary) {
+                    if (!session->is_challenge_solved()) {
+                        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::AUTH_FAILURE,
+                                          session->remote_address(), "Unauthenticated binary relay attempt");
+                        net::post(session->get_executor(), [session]() { session->close(); });
+                        return;
+                    }
+                    
+                    if (data.size() > 64) {
+                        std::string recipient = data.substr(0, 64);
+                        relay_ptr->relay_binary(
+                            recipient,
+                            data.data() + 64,
+                            data.size() - 64,
+                            session
+                        );
                     }
                     return;
                 }
 
-                if (!session->is_challenge_solved()) {
-                    SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::AUTH_FAILURE,
-                                      session->remote_address(), "Unauthenticated message attempt: " + type);
-                    session->close();
-                    return;
-                }
-
-                if (type == "ack") {
-                    if (obj.contains("ids") && obj["ids"].is_array()) {
-                        std::vector<int64_t> ids;
-                        for (const auto& id_val : obj["ids"].as_array()) {
-                            if (id_val.is_int64()) {
-                                ids.push_back(id_val.as_int64());
-                            }
-                        }
-                        relay_ptr->confirm_delivery(ids);
+                // JSON Handling
+                try {
+                    auto json_val = InputValidator::safe_parse_json(data);
+                    if (!json_val.is_object()) {
+                        SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::INVALID_INPUT,
+                                          session->remote_address(), "Invalid JSON structure");
+                        return;
                     }
-                    return;
-                }
+                    
+                    auto& obj = json_val.as_object();
+                    std::string type;
+                    if (obj.contains("type")) {
+                        type = std::string(obj["type"].as_string());
+                    }
+                    
+                    if (type == "ping") {
+                        json::object pong;
+                        pong["type"] = "pong";
+                        if (obj.contains("timestamp")) pong["timestamp"] = obj["timestamp"];
+                        std::string pong_str = json::serialize(pong);
+                        // Standardize heartbeat padding to 512 bytes
+                        TrafficNormalizer::pad_serialized_json(pong_str, 512);
+                        session->send_text(std::move(pong_str));
+                        return;
+                    }
 
-                if (type == "subscribe_alias") {
-                    if (obj.contains("payload")) {
-                        try {
-                            auto& alias_payload = obj["payload"].as_object();
+                    if (type == "pow_challenge") {
+                        auto res = identity_handler->handle_pow_challenge_ws(obj, session->remote_address());
+                        net::post(session->get_executor(), [session, res, pacing_size]() {
+                            std::string res_str = json::serialize(res);
+                            TrafficNormalizer::pad_serialized_json(res_str, pacing_size);
+                            session->send_text(std::move(res_str));
+                        });
+                        return;
+                    }
+
+                    if (type == "fetch_key_random") {
+                        auto res = identity_handler->handle_keys_random_ws(obj, session->remote_address());
+                        net::post(session->get_executor(), [session, res, pacing_size]() {
+                            std::string res_str = json::serialize(res);
+                            TrafficNormalizer::pad_serialized_json(res_str, pacing_size);
+                            session->send_text(std::move(res_str));
+                        });
+                        return;
+                    }
+
+                    if (type == "keys_upload") {
+                        auto res = identity_handler->handle_keys_upload_ws(obj, session->remote_address());
+                        net::post(session->get_executor(), [session, res, pacing_size]() {
+                            std::string res_str = json::serialize(res);
+                            TrafficNormalizer::pad_serialized_json(res_str, pacing_size);
+                            session->send_text(std::move(res_str));
+                        });
+                        return;
+                    }
+
+                    if (type == "fetch_key") {
+                        auto res = identity_handler->handle_keys_fetch_ws(obj, session->remote_address());
+                        net::post(session->get_executor(), [session, res, pacing_size]() {
+                            std::string res_str = json::serialize(res);
+                            TrafficNormalizer::pad_serialized_json(res_str, pacing_size);
+                            session->send_text(std::move(res_str));
+                        });
+                        return;
+                    }
+
+                    if (type == "nickname_lookup") {
+                        auto res = identity_handler->handle_nickname_lookup_ws(obj, session->remote_address());
+                        net::post(session->get_executor(), [session, res, pacing_size]() {
+                            std::string res_str = json::serialize(res);
+                            TrafficNormalizer::pad_serialized_json(res_str, pacing_size);
+                            session->send_text(std::move(res_str));
+                        });
+                        return;
+                    }
+
+                    if (type == "nickname_register") {
+                        auto res = identity_handler->handle_nickname_register_ws(obj, session->remote_address());
+                        net::post(session->get_executor(), [session, res, pacing_size]() {
+                            std::string res_str = json::serialize(res);
+                            TrafficNormalizer::pad_serialized_json(res_str, pacing_size);
+                            session->send_text(std::move(res_str));
+                        });
+                        return;
+                    }
+
+                    if (type == "account_burn") {
+                        auto res = identity_handler->handle_account_burn_ws(obj, session->remote_address());
+                        net::post(session->get_executor(), [session, res, pacing_size]() {
+                            std::string res_str = json::serialize(res);
+                            TrafficNormalizer::pad_serialized_json(res_str, pacing_size);
+                            session->send_text(std::move(res_str));
+                        });
+                        return;
+                    }
+
+                    if (type == "link_preview") {
+                        auto res = identity_handler->handle_link_preview_ws(obj, session->remote_address());
+                        net::post(session->get_executor(), [session, res, pacing_size]() {
+                            std::string res_str = json::serialize(res);
+                            TrafficNormalizer::pad_serialized_json(res_str, pacing_size);
+                            session->send_text(std::move(res_str));
+                        });
+                        return;
+                    }
+
+                    if (type == "dummy" || type == "dummy_pacing") {
+                        return; 
+                    }
+
+                    if (type == "auth") {
+                        if (obj.contains("payload")) {
+                            auto auth_payload = obj.at("payload").as_object();
+                            std::string id_hash;
+                            if (auth_payload.contains("identity_hash")) id_hash = std::string(auth_payload.at("identity_hash").as_string());
+                            std::string hash = InputValidator::sanitize_field(id_hash, 256);
+
+                            bool auth_valid = false;
+
+                            if (auth_payload.contains("session_token") && auth_payload.at("session_token").is_string()) {
+                                std::string token = std::string(auth_payload.at("session_token").as_string());
+                                if (redis_ptr->verify_session_token(hash, token)) {
+                                    auth_valid = true;
+                                }
+                            }
+
+                            if (!auth_valid) {
+                                std::string seed;
+                                if (auth_payload.contains("seed") && auth_payload.at("seed").is_string()) 
+                                    seed = std::string(auth_payload.at("seed").as_string());
+                                
+                                std::string nonce;
+                                if (auth_payload.contains("nonce")) {
+                                    if (auth_payload.at("nonce").is_string()) nonce = std::string(auth_payload.at("nonce").as_string());
+                                    else if (auth_payload.at("nonce").is_number()) nonce = std::to_string(auth_payload.at("nonce").as_int64());
+                                }
+                                
+                                int intensity_penalty = 0;
+                                int intensity = redis_ptr->get_registration_intensity();
+                                if (intensity > 10) intensity_penalty = 2;
+                                if (intensity > 50) intensity_penalty = 4;
+                                if (intensity > 200) intensity_penalty = 8;
+                                
+                                long long age = redis_ptr->get_account_age(hash);
+                                int required_difficulty = ::entropy::PoWVerifier::get_required_difficulty(intensity_penalty, age);
+
+                                if (!seed.empty() && !nonce.empty() && rate_limiter_ptr->consume_challenge(seed) && 
+                                    ::entropy::PoWVerifier::verify(seed, nonce, hash, required_difficulty)) {
+                                    auth_valid = true;
+                                }
+                            }
+
+                            net::post(session->get_executor(), [session, hash, auth_valid, redis_ptr, conn_mgr_ptr, key_storage_ptr, relay_ptr, max_conns, pacing_size]() {
+                                if (!auth_valid || hash.empty()) {
+                                        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::AUTH_FAILURE,
+                                                        session->remote_address(), "Authentication failed");
+                                        
+                                        json::object error;
+                                        error["type"] = "error";
+                                        error["code"] = "auth_failed";
+                                        error["message"] = "Authentication failed. Token may be expired.";
+                                        std::string res_str = json::serialize(error);
+                                        TrafficNormalizer::pad_serialized_json(res_str, pacing_size);
+                                        session->send_text(std::move(res_str));
+                                        session->close();
+                                        return;
+                                }
+                                
+                                if (!conn_mgr_ptr->add_connection_with_limit(hash, session, session->remote_address(), max_conns)) {
+                                    SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::RATE_LIMIT_HIT,
+                                                        session->remote_address(), "Connection limit exceeded for IP");
+                                    json::object error;
+                                    error["type"] = "error";
+                                    error["code"] = "connection_limit";
+                                    error["message"] = "Too many connections from your IP address";
+                                    std::string res_str = json::serialize(error);
+                                    TrafficNormalizer::pad_serialized_json(res_str, pacing_size);
+                                    session->send_text(std::move(res_str));
+                                    session->close();
+                                    return;
+                                }
+                                
+                                session->set_user_data(hash);
+                                session->set_challenge_solved(true);
+                                session->set_authenticated(true);
+                                
+                                SecurityLogger::log(SecurityLogger::Level::INFO, SecurityLogger::EventType::AUTH_SUCCESS,
+                                                    session->remote_address(), "User authenticated");
+
+                                auto exec = redis_ptr->get_blocking_executor();
+                                net::post(exec, [redis_ptr, key_storage_ptr, relay_ptr, session, hash, pacing_size]() {
+                                    std::string new_token = redis_ptr->create_session_token(hash, 3600);
+                                    std::string bundle = key_storage_ptr->get_bundle(hash);
+
+                                    net::post(session->get_executor(), [session, hash, new_token, bundle, relay_ptr, pacing_size]() {
+                                        json::object response;
+                                        response["type"] = "auth_success";
+                                        response["identity_hash"] = hash;
+                                        if (!new_token.empty()) response["session_token"] = new_token;
+                                        response["keys_missing"] = bundle.empty();
+                                        
+                                        std::string resp_str = json::serialize(response);
+                                        TrafficNormalizer::pad_serialized_json(resp_str, pacing_size);
+                                        session->send_text(std::move(resp_str));
+                                        
+                                        relay_ptr->deliver_pending(hash, session);
+                                    });
+                                });
+                            });
+                        }
+                        return;
+                    }
+
+                    if (!session->is_challenge_solved()) {
+                        SecurityLogger::log(SecurityLogger::Level::ERROR, SecurityLogger::EventType::AUTH_FAILURE,
+                                          session->remote_address(), "Unauthenticated message attempt: " + type);
+                        net::post(session->get_executor(), [session]() { session->close(); });
+                        return;
+                    }
+
+                    if (type == "ack") {
+                        if (obj.contains("ids") && obj["ids"].is_array()) {
+                            std::vector<int64_t> ids;
+                            for (const auto& id_val : obj["ids"].as_array()) {
+                                if (id_val.is_int64()) {
+                                    ids.push_back(id_val.as_int64());
+                                }
+                            }
+                            relay_ptr->confirm_delivery(ids);
+                        }
+                        return;
+                    }
+
+                    if (type == "subscribe_alias") {
+                        if (obj.contains("payload")) {
+                            auto alias_payload = obj.at("payload").as_object();
                             std::string seed;
-                            if (alias_payload.contains("seed") && alias_payload["seed"].is_string()) 
-                                seed = std::string(alias_payload["seed"].as_string());
+                            if (alias_payload.contains("seed") && alias_payload.at("seed").is_string()) 
+                                seed = std::string(alias_payload.at("seed").as_string());
                             
                             std::string nonce;
                             if (alias_payload.contains("nonce")) {
-                                if (alias_payload["nonce"].is_string()) nonce = std::string(alias_payload["nonce"].as_string());
-                                else if (alias_payload["nonce"].is_number()) nonce = std::to_string(alias_payload["nonce"].as_int64());
+                                if (alias_payload.at("nonce").is_string()) nonce = std::string(alias_payload.at("nonce").as_string());
+                                else if (alias_payload.at("nonce").is_number()) nonce = std::to_string(alias_payload.at("nonce").as_int64());
                             }
 
-                            
-                            if (alias_payload.contains("alias") && alias_payload["alias"].is_string()) {
-                                std::string alias = std::string(alias_payload["alias"].as_string());
+                            if (alias_payload.contains("alias") && alias_payload.at("alias").is_string()) {
+                                std::string alias = std::string(alias_payload.at("alias").as_string());
                                 std::string safe_alias = InputValidator::sanitize_field(alias, 256);
 
-                                if (seed.empty() || nonce.empty() || !rate_limiter_ptr->consume_challenge(seed) || 
-                                    !::entropy::PoWVerifier::verify(seed, nonce, safe_alias)) {
-                                     SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::AUTH_FAILURE,
-                                                       session->remote_address(), "Alias subscription PoW invalid or unbound: " + safe_alias);
-                                     session->close();
-                                     return;
-                                }
+                                bool valid = !seed.empty() && !nonce.empty() && 
+                                                rate_limiter_ptr->consume_challenge(seed) && 
+                                                ::entropy::PoWVerifier::verify(seed, nonce, safe_alias);
 
-                                if (!safe_alias.empty() && session->can_add_alias()) {
-                                    session->add_alias(safe_alias);
-                                    conn_mgr_ptr->add_connection(safe_alias, session);
-                                    relay_ptr->subscribe_user(safe_alias);
-                                    relay_ptr->deliver_pending(safe_alias, session);
-                                    
-                                    json::object response;
-                                    response["type"] = "alias_subscribed";
-                                    response["alias"] = safe_alias;
-                                    TrafficNormalizer::pad_json(response, 1536);
-                                    session->send_text(json::serialize(response));
-                                } else if (!safe_alias.empty()) {
-                                    json::object error;
-                                    error["type"] = "error";
-                                    error["message"] = "Maximum alias limit reached";
-                                    session->send_text(json::serialize(error));
-                                }
+                                net::post(session->get_executor(), [session, safe_alias, valid, conn_mgr_ptr, relay_ptr, pacing_size]() {
+                                    if (!valid) {
+                                            SecurityLogger::log(SecurityLogger::Level::WARNING, SecurityLogger::EventType::AUTH_FAILURE,
+                                                            session->remote_address(), "Alias subscription PoW invalid or unbound: " + safe_alias);
+                                            session->close();
+                                            return;
+                                    }
+
+                                    if (!safe_alias.empty() && session->can_add_alias()) {
+                                        session->add_alias(safe_alias);
+                                        conn_mgr_ptr->add_connection(safe_alias, session);
+                                        relay_ptr->deliver_pending(safe_alias, session);
+                                        
+                                        json::object response;
+                                        response["type"] = "alias_subscribed";
+                                        response["alias"] = safe_alias;
+                                        std::string res_str = json::serialize(response);
+                                        TrafficNormalizer::pad_serialized_json(res_str, pacing_size);
+                                        session->send_text(std::move(res_str));
+                                    } else if (!safe_alias.empty()) {
+                                        json::object error;
+                                        error["type"] = "error";
+                                        error["message"] = "Maximum alias limit reached";
+                                        session->send_text(json::serialize(error));
+                                    }
+                                });
                             }
-                        } catch (...) {}
-                    }
-                    return;
-                }
-
-                if (type == "volatile_relay") {
-                    if (obj.contains("to") && obj.contains("body")) {
-                        std::string to = std::string(obj["to"].as_string());
-                        std::string body = std::string(obj["body"].as_string());
-                        
-                        relay_ptr->relay_volatile(to, body.data(), body.size(), session);
-                    }
-                    return;
-                }
-
-
-
-                if (type == "group_multicast") {
-                    if (!session->is_authenticated()) {
-                        json::object err;
-                        err["type"] = "error";
-                        err["message"] = "Authentication required for multicast";
-                        session->send_text(json::serialize(err));
+                        }
                         return;
                     }
-                    if (obj.contains("targets") && obj["targets"].is_array()) {
-                        auto& targets = obj["targets"].as_array();
-                        int cost = static_cast<int>(targets.size());
-                        auto limit_res = rate_limiter_ptr->check("ws_multi:" + b_ip, 500, 60, cost);
-                        
-                        if (!limit_res.allowed) {
-                            json::object err;
-                            err["type"] = "error";
-                            err["code"] = "rate_limit";
-                            err["message"] = "Multicast rate limit exceeded";
-                            session->send_text(json::serialize(err));
-                            return;
-                        }
-                        
-                        relay_ptr->relay_group_message(targets, session);
-                    }
-                    return;
-                }
 
-                relay_ptr->relay_message(data, session);
-                
-            } catch (const std::exception& e) {
-                std::cerr << "[!] Error processing message: " << e.what() << "\n";
-            }
-        });
+                    if (type == "volatile_relay") {
+                        if (obj.contains("to") && obj.contains("body")) {
+                            std::string to = std::string(obj["to"].as_string());
+                            std::string body = std::string(obj["body"].as_string());
+                            
+                            relay_ptr->relay_volatile(to, body.data(), body.size(), session);
+                        }
+                        return;
+                    }
+
+                    if (type == "message" || type == "voice" || type == "video" || type == "signal" || type == "msg_fragment") {
+                        relay_ptr->relay_message(obj, session);
+                        return;
+                    }
+                    
+                } catch (const std::exception& e) {
+                    std::cerr << "[!] Error processing message: " << e.what() << "\n";
+                }
+            });
+    });
     
     
     ws_session->set_close_handler(
         [conn_mgr_ptr, relay_ptr](WebSocketSession* session) {
-            std::string user_data = session->get_user_data();
-            if (!user_data.empty()) {
-                relay_ptr->unsubscribe_user(user_data);
-            }
-            for (const auto& alias : session->get_aliases()) {
-                relay_ptr->unsubscribe_user(alias);
-            }
             conn_mgr_ptr->remove_session(session);
             std::cout << "[*] WebSocket connection closed\n";
         });

@@ -28,7 +28,6 @@ public:
     json::object handle_keys_fetch_ws(const json::object& req, const std::string& remote_addr);
     json::object handle_nickname_register_ws(const json::object& req, const std::string& remote_addr);
     
-    // WebSocket-native variants (returning JSON objects for normalization)
     json::object handle_pow_challenge_ws(const json::object& req, const std::string& remote_addr);
     json::object handle_keys_random_ws(const json::object& req, const std::string& remote_addr);
     json::object handle_nickname_lookup_ws(const json::object& req, const std::string& remote_addr);
@@ -46,4 +45,4 @@ private:
 
 };
 
-} // namespace entropy
+}

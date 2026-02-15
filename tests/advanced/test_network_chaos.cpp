@@ -13,6 +13,10 @@
 #include "rate_limiter.hpp"
 #include "server_config.hpp"
 #include "redis_manager.hpp"
+#include "key_storage.hpp"
+#include "handlers/health_handler.hpp"
+#include "handlers/identity_handler.hpp"
+
 using namespace entropy;
 namespace asio = boost::asio;
 namespace beast = boost::beast;
@@ -27,11 +31,16 @@ protected:
     MessageRelay relay{cm, redis, rate_limiter, config};
     asio::io_context ioc;
     std::unique_ptr<tcp::acceptor> acceptor;
+    std::shared_ptr<HealthHandler> health_handler;
+    std::shared_ptr<IdentityHandler> identity_handler;
     std::thread server_thread;
     uint16_t server_port = 0;
     std::atomic<bool> server_running{false};
     void SetUp() override {
         config.connection_timeout_sec = 2;  
+        redis.set_blocking_executor(ioc.get_executor());
+        health_handler = std::make_shared<HealthHandler>(config, cm);
+        identity_handler = std::make_shared<IdentityHandler>(config, redis, redis, rate_limiter);
         start_server();
     }
     void TearDown() override {
@@ -60,7 +69,8 @@ protected:
                 auto guard = std::make_shared<int>(1); 
                 std::make_shared<HttpSession>(
                     beast::tcp_stream(std::move(socket)),
-                    config, cm, relay, rate_limiter, redis, redis, guard
+                    config, cm, relay, rate_limiter, redis, redis, 
+                    health_handler, identity_handler, guard
                 )->run();
             }
             accept_loop();
@@ -76,7 +86,7 @@ TEST_F(NetworkChaosTest, SlowlorisAttack) {
     std::string partial_req = "GET / HTTP/1.1\r\n";
     asio::write(socket, asio::buffer(partial_req));
 
-    // Wait > connection_timeout_sec (2s)
+    // Wait > connection_timeout_sec (3s)
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
     // Server should have closed the connection

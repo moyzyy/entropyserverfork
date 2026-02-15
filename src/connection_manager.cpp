@@ -1,5 +1,6 @@
 #include <boost/json.hpp>
 #include <openssl/sha.h>
+#include <openssl/hmac.h>
 #include <iomanip>
 #include <sstream>
 #include <random>
@@ -14,77 +15,25 @@ namespace json = boost::json;
 
 namespace entropy {
 
-    /**
-     * ConnectionManager Constructor.
-     * Initializes the manager with a server-specific salt for ID blinding.
-     */
     ConnectionManager::ConnectionManager(const std::string& salt) : salt_(salt) {}
 
-    /**
-     * Routes a distributed message from the Redis pub/sub layer to a local session.
-     * Uses blinded ID mapping to preserve anonymity in the routing table.
-     */
-    void ConnectionManager::process_distributed_message_for_blinded_id(const std::string& blinded_id, const std::string& message_json) {
-        std::shared_lock lock(connections_mutex_);
-        auto it = connections_.find(blinded_id);
-        if (it != connections_.end()) {
-            if (auto session = it->second.lock()) {
-                session->send_text(message_json);
+    ConnectionManager::~ConnectionManager() {
+        std::unique_lock lock(connections_mutex_);
+        pacing_timer_.reset();
+        for (auto& [ptr, weak] : unique_sessions_) {
+            if (auto s = weak.lock()) {
+                s->set_close_handler(nullptr);
             }
         }
     }
 
-// Parses a distributed message and routes it to one or more local recipients.
-void ConnectionManager::process_distributed_message(const std::string& message_json) {
-    try {
-        auto json_val = json::parse(message_json);
-        if (!json_val.is_object()) return;
-        
-        auto& obj = json_val.as_object();
-        
-        auto deliver_to = [this, &message_json](const std::string& to_hash) {
-            std::string blinded = blind_id(to_hash);
-            std::shared_lock lock(connections_mutex_);
-            auto it = connections_.find(blinded);
-            if (it != connections_.end()) {
-                if (auto session = it->second.lock()) {
-                    session->send_text(message_json);
-                }
-            }
-        };
-
-        if (obj.contains("to")) {
-            if (obj["to"].is_string()) {
-                deliver_to(std::string(obj["to"].as_string()));
-            } else if (obj["to"].is_array()) {
-                for (const auto& r : obj["to"].as_array()) {
-                    if (r.is_string()) {
-                        deliver_to(std::string(r.as_string()));
-                    }
-                }
-            }
-        }
-    } catch (const std::exception& e) {
-        SecurityLogger::log(SecurityLogger::Level::ERROR, 
-                           SecurityLogger::EventType::INVALID_INPUT, 
-                           "SYSTEM", 
-                           "JSON Distribution Failed: " + std::string(e.what()));
-    } catch (...) {
-        SecurityLogger::log(SecurityLogger::Level::ERROR,
-                           SecurityLogger::EventType::SUSPICIOUS_ACTIVITY,
-                           "SYSTEM",
-                           "Unknown error in distributed message processing");
-    }
-}
-
-// Registers a session in the connection pool.
 void ConnectionManager::add_connection(const std::string& pub_key_hash, SessionPtr session) {
     std::string blinded = blind_id(pub_key_hash);
     std::unique_lock lock(connections_mutex_);
     connections_[blinded] = session;
+    unique_sessions_[session.get()] = session;
 }
 
-// Registers a session in the connection pool while enforcing per-IP resource limits.
 bool ConnectionManager::add_connection_with_limit(const std::string& pub_key_hash, 
                                                    SessionPtr session,
                                                    const std::string& ip_address,
@@ -92,9 +41,8 @@ bool ConnectionManager::add_connection_with_limit(const std::string& pub_key_has
     std::unique_lock lock(connections_mutex_);
     
     std::string b_ip = blind_id(ip_address);
-    size_t count = ip_counts_[b_ip];
+    size_t& count = ip_counts_[b_ip];
     
-    // Check against max_per_ip (this is a secondary check, primary is in on_accept)
     if (count > max_per_ip) {
         MetricsRegistry::instance().increment_counter("connection_rejected_limit_total");
         return false;
@@ -102,6 +50,7 @@ bool ConnectionManager::add_connection_with_limit(const std::string& pub_key_has
     
     std::string blinded = blind_id(pub_key_hash);
     connections_[blinded] = session;
+    unique_sessions_[session.get()] = session;
     
     if (!session->is_authenticated()) {
         session->set_authenticated(true);
@@ -117,11 +66,22 @@ bool ConnectionManager::add_connection_with_limit(const std::string& pub_key_has
         if (!session) return;
         
         std::unique_lock lock(connections_mutex_);
-        std::string b_ip = blind_id(session->remote_address());
-        std::string user_data = session->get_user_data();
         
+        // Decrement IP count if we have the address
+        std::string ip = session->remote_address();
+        if (!ip.empty()) {
+             std::string b_ip = blind_id(ip);
+             auto it = ip_counts_.find(b_ip);
+             if (it != ip_counts_.end()) {
+                 if (it->second > 0) it->second--;
+                 if (it->second == 0) ip_counts_.erase(it);
+             }
+        }
+
+        std::string user_data = session->get_user_data();
         if (!user_data.empty()) {
-            std::string blinded = blind_id(user_data);
+            std::string blinded = session->get_blinded_user_data();
+            if (blinded.empty()) blinded = blind_id(user_data); 
             auto it = connections_.find(blinded);
             if (it != connections_.end()) {
                 if (auto existing = it->second.lock()) {
@@ -148,9 +108,10 @@ bool ConnectionManager::add_connection_with_limit(const std::string& pub_key_has
             MetricsRegistry::instance().decrement_gauge("active_connections");
             session->set_authenticated(false);
         }
+
+        unique_sessions_.erase(session);
     }
 
-// Returns a direct reference to a session given a public key hash.
 ConnectionManager::SessionPtr ConnectionManager::get_connection(const std::string& pub_key_hash) {
     std::string blinded = blind_id(pub_key_hash);
     std::shared_lock lock(connections_mutex_);
@@ -161,7 +122,6 @@ ConnectionManager::SessionPtr ConnectionManager::get_connection(const std::strin
     return nullptr;
 }
 
-// Checks if a given ID is currently connected to this specific server instance.
 bool ConnectionManager::is_online(const std::string& pub_key_hash) {
     if (pub_key_hash.empty()) return false;
     std::string blinded = blind_id(pub_key_hash);
@@ -175,7 +135,7 @@ bool ConnectionManager::is_online(const std::string& pub_key_hash) {
 
 size_t ConnectionManager::connection_count() const {
     std::shared_lock lock(connections_mutex_);
-    return connections_.size();
+    return unique_sessions_.size();
 }
 
 size_t ConnectionManager::connection_count_for_ip(const std::string& ip_address) const {
@@ -188,7 +148,6 @@ size_t ConnectionManager::connection_count_for_ip(const std::string& ip_address)
     return 0;
 }
 
-// Scans and removes entries for sessions that have timed out or been disconnected.
 void ConnectionManager::cleanup_dead_connections() {
     {
         std::unique_lock lock(connections_mutex_);
@@ -199,15 +158,21 @@ void ConnectionManager::cleanup_dead_connections() {
                 ++it;
             }
         }
+        for (auto it = unique_sessions_.begin(); it != unique_sessions_.end(); ) {
+            if (it->second.expired()) {
+                it = unique_sessions_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 }
 
-// Closes all tracked websocket sessions immediately.
 void ConnectionManager::close_all_connections() {
     std::vector<SessionPtr> active_sessions;
     {
         std::shared_lock lock(connections_mutex_);
-        for (auto const& [id, weak_session] : connections_) {
+        for (auto const& [ptr, weak_session] : unique_sessions_) {
             if (auto session = weak_session.lock()) {
                 active_sessions.push_back(session);
             }
@@ -221,20 +186,22 @@ void ConnectionManager::close_all_connections() {
     }
 }
 
-    /**
-     * Generates a salted SHA256 "Blinded ID" to decouple public identity from session tracking.
-     * This provides a primitive layer of metadata resistance for the routing layer.
-     */
     std::string ConnectionManager::blind_id(const std::string& id) const {
-        std::string data = id + salt_;
+        unsigned int len = SHA256_DIGEST_LENGTH;
         unsigned char hash[SHA256_DIGEST_LENGTH];
-        SHA256(reinterpret_cast<const unsigned char*>(data.c_str()), data.size(), hash);
         
-        std::stringstream ss;
+        HMAC(EVP_sha256(), salt_.c_str(), salt_.size(), 
+             reinterpret_cast<const unsigned char*>(id.c_str()), id.size(), 
+             hash, &len);
+        
+        static const char hex_chars[] = "0123456789abcdef";
+        std::string result;
+        result.reserve(SHA256_DIGEST_LENGTH * 2);
         for(int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-            ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+            result.push_back(hex_chars[hash[i] >> 4]);
+            result.push_back(hex_chars[hash[i] & 0x0F]);
         }
-        return ss.str();
+        return result;
     }
 
 bool ConnectionManager::increment_ip_count(const std::string& ip, size_t limit) {
@@ -256,5 +223,41 @@ void ConnectionManager::decrement_ip_count(const std::string& ip) {
     }
 }
 
+void ConnectionManager::start_pacing_loop(net::io_context& ioc, int interval_ms) {
+    pacing_timer_ = std::make_unique<net::steady_timer>(ioc, std::chrono::milliseconds(interval_ms));
+    pacing_timer_->async_wait([this, interval_ms](beast::error_code ec) {
+        if (!ec) on_pacing_tick(interval_ms);
+    });
 }
- 
+
+void ConnectionManager::on_pacing_tick(int interval_ms) {
+    {
+        std::shared_lock lock(connections_mutex_);
+        sessions_to_flush_cache_.clear();
+        sessions_to_flush_cache_.reserve(unique_sessions_.size());
+        
+        for (auto const& [ptr, weak_session] : unique_sessions_) {
+            if (auto session = weak_session.lock()) {
+                sessions_to_flush_cache_.push_back(session);
+            }
+        }
+    }
+
+    for (auto& session : sessions_to_flush_cache_) {
+        net::post(session->get_executor(), [session = std::move(session)]() {
+            session->flush_pacing_queue();
+            session->check_dummy_traffic(); 
+        });
+    }
+    sessions_to_flush_cache_.clear();
+
+    std::unique_lock lock(connections_mutex_);
+    if (pacing_timer_) {
+        pacing_timer_->expires_after(std::chrono::milliseconds(interval_ms));
+        pacing_timer_->async_wait([this, interval_ms](beast::error_code ec) {
+            if (!ec) on_pacing_tick(interval_ms);
+        });
+    }
+}
+
+}

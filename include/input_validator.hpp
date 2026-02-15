@@ -1,6 +1,8 @@
 #pragma once
 
 #include <string>
+#include <string_view>
+#include <charconv>
 #include <cctype>
 #include <algorithm>
 #include <vector>
@@ -10,7 +12,6 @@
 
 namespace entropy {
 
-// Comprehensive Input Validation and Cryptographic Verification.
 class InputValidator {
 public:
     /**
@@ -53,68 +54,49 @@ public:
                              const std::vector<unsigned char>& signature) {
         if (x25519_pubkey.size() != 32 || signature.size() != 64) return false;
 
-        // XEdDSA Conversion:
-        // y = (u - 1) / (u + 1) mod p
-        // where u is the X25519 public key.
+        auto bn_deleter = [](BIGNUM* b) { BN_free(b); };
+        auto ctx_deleter = [](BN_CTX* c) { BN_CTX_free(c); };
         
-        BN_CTX* ctx = BN_CTX_new();
+        std::unique_ptr<BN_CTX, decltype(ctx_deleter)> ctx(BN_CTX_new(), ctx_deleter);
         if (!ctx) return false;
         
-        BIGNUM* u = BN_new();
-        // X25519 keys are little-endian.
+        std::unique_ptr<BIGNUM, decltype(bn_deleter)> u(BN_new(), bn_deleter);
         std::vector<unsigned char> u_be = x25519_pubkey;
         std::reverse(u_be.begin(), u_be.end());
-        BN_bin2bn(u_be.data(), 32, u);
+        BN_bin2bn(u_be.data(), 32, u.get());
         
-        BIGNUM* p = BN_new();
-        // Prime p = 2^255 - 19
-        BN_set_bit(p, 255);
-        BN_sub_word(p, 19);
+        std::unique_ptr<BIGNUM, decltype(bn_deleter)> p(BN_new(), bn_deleter);
+        BN_set_bit(p.get(), 255);
+        BN_sub_word(p.get(), 19);
         
         const BIGNUM* one = BN_value_one();
         
-        BIGNUM* u_minus_1 = BN_new();
-        BN_sub(u_minus_1, u, one);
-        BN_nnmod(u_minus_1, u_minus_1, p, ctx);
+        std::unique_ptr<BIGNUM, decltype(bn_deleter)> u_minus_1(BN_new(), bn_deleter);
+        BN_sub(u_minus_1.get(), u.get(), one);
+        BN_nnmod(u_minus_1.get(), u_minus_1.get(), p.get(), ctx.get());
         
-        BIGNUM* u_plus_1 = BN_new();
-        BN_add(u_plus_1, u, one);
-        BN_nnmod(u_plus_1, u_plus_1, p, ctx);
+        std::unique_ptr<BIGNUM, decltype(bn_deleter)> u_plus_1(BN_new(), bn_deleter);
+        BN_add(u_plus_1.get(), u.get(), one);
+        BN_nnmod(u_plus_1.get(), u_plus_1.get(), p.get(), ctx.get());
         
-        BIGNUM* inv_u_plus_1 = BN_new();
-        if (!BN_mod_inverse(inv_u_plus_1, u_plus_1, p, ctx)) {
-            BN_free(u); BN_free(p); BN_free(u_minus_1); BN_free(u_plus_1); BN_free(inv_u_plus_1); BN_CTX_free(ctx);
+        std::unique_ptr<BIGNUM, decltype(bn_deleter)> inv_u_plus_1(BN_new(), bn_deleter);
+        if (!BN_mod_inverse(inv_u_plus_1.get(), u_plus_1.get(), p.get(), ctx.get())) {
             return false;
         }
         
-        BIGNUM* y = BN_new();
-        BN_mod_mul(y, u_minus_1, inv_u_plus_1, p, ctx);
+        std::unique_ptr<BIGNUM, decltype(bn_deleter)> y(BN_new(), bn_deleter);
+        BN_mod_mul(y.get(), u_minus_1.get(), inv_u_plus_1.get(), p.get(), ctx.get());
         
         std::vector<unsigned char> ed_pubkey(32, 0);
-        BN_bn2binpad(y, ed_pubkey.data(), 32);
+        BN_bn2binpad(y.get(), ed_pubkey.data(), 32);
         
-        // Convert to little-endian for Ed25519 format
         std::reverse(ed_pubkey.begin(), ed_pubkey.end());
-        
-        // XEdDSA uses the "positive" x-coordinate, which corresponds to 
-        // the sign bit 0 in the Ed25519 bit-string representation.
         ed_pubkey[31] &= 0x7F; 
         
-        bool result = verify_ed25519(ed_pubkey, message, signature);
-        
-        BN_free(u);
-        BN_free(p);
-        BN_free(u_minus_1);
-        BN_free(u_plus_1);
-        BN_free(inv_u_plus_1);
-        BN_free(y);
-        BN_CTX_free(ctx);
-        
-        return result;
+        return verify_ed25519(ed_pubkey, message, signature);
     }
 
-    // Validates that a string is a correctly formatted hexadecimal sequence.
-    static bool is_valid_hex(const std::string& str, size_t expected_length = 0) {
+    static bool is_valid_hex(std::string_view str, size_t expected_length = 0) {
         if (str.empty()) return false;
         if (expected_length > 0 && str.length() != expected_length) return false;
         
@@ -123,24 +105,21 @@ public:
         });
     }
     
-    // Checks for a valid SHA256 hex hash (64 characters).
-    static bool is_valid_hash(const std::string& hash) {
+    static bool is_valid_hash(std::string_view hash) {
         // Support both standard 32-byte hashes (64-char hex) 
-        // and 33-byte Signal identity keys (66-char hex starting with 05).
+        // and 33-byte identity keys (66-char hex starting with 05).
         return is_valid_hex(hash, 64) || is_valid_hex(hash, 66);
     }
     
-    // Checks for safe alphanumeric characters (including underscores and hyphens).
-    static bool is_valid_alphanumeric(const std::string& str) {
+    static bool is_valid_alphanumeric(std::string_view str) {
         if (str.empty()) return false;
         return std::all_of(str.begin(), str.end(), [](char c) {
             return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-';
         });
     }
 
-    // Filters and limits string input to alphanumeric/underscores to prevent injection.
-    static std::string sanitize_field(const std::string& input, size_t max_length = 256) {
-        if (input.empty()) return input;
+    static std::string sanitize_field(std::string_view input, size_t max_length = 256) {
+        if (input.empty()) return std::string();
         
         std::string result;
         result.reserve(std::min(input.size(), max_length));
@@ -151,7 +130,7 @@ public:
             if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == ' ') {
                 result += c;
             } else {
-                result += ' ';
+                result += ' '; // Replace invalid chars with space to maintain length but sanitize
             }
         }
         
@@ -163,25 +142,24 @@ public:
     }
 
     /**
-     * Authenticated JSON Parsing with recursion depth limits to prevent stack-exhaustion (DoS).
+     * Authenticated JSON Parsing with recursion depth limits to prevent stack-exhaustion.
      */
-    static boost::json::value safe_parse_json(const std::string& input) {
+    static boost::json::value safe_parse_json(std::string_view input) {
         boost::json::parse_options opt;
-        opt.max_depth = 16; 
+        opt.max_depth = 8; 
         return boost::json::parse(input, {}, opt);
     }
 
-    // Decodes URL-encoded strings (e.g., %20 to space).
-    static std::string url_decode(const std::string& str) {
+    static std::string url_decode(std::string_view str) {
         std::string result;
         result.reserve(str.length());
         
         for (size_t i = 0; i < str.length(); ++i) {
             if (str[i] == '%' && i + 2 < str.length()) {
                 int hex_val = 0;
-                std::stringstream ss;
-                ss << std::hex << str.substr(i + 1, 2);
-                if (ss >> hex_val) {
+                auto hex_str = str.substr(i + 1, 2);
+                auto [ptr, ec] = std::from_chars(hex_str.data(), hex_str.data() + hex_str.size(), hex_val, 16);
+                if (ec == std::errc()) {
                     result += static_cast<char>(hex_val);
                     i += 2;
                 } else {

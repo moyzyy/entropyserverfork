@@ -4,95 +4,89 @@
 [![License](https://img.shields.io/badge/license-AGPLv3-blue?style=for-the-badge&logo=gnu)](./LICENSE)
 [![Protocol](https://img.shields.io/badge/Architecture-Distributed-orange?style=for-the-badge)](./SPECS.md)
 
-**Entropy Server** is a high-performance, stateless relay designed for sovereign messaging. It functions as a "Zero-Knowledge" backbone, ensuring that metadata is never stored and routing remains blinded to the network operator.
+**Entropy Server** is a high-performance, stateless relay designed for sovereign messaging. It functions as a "Zero-Knowledge" backbone, ensuring that metadata is never stored and routing remains blinded to the network operator via cryptographic salts and aggressive traffic normalization.
 
 ---
 
-## ✨ What the Server Does
+## ✨ Core Features
 
-The Entropy Server routes encrypted messages between clients without knowing their identities or reading message contents.  
+### 🔐 Zero-Knowledge Routing
+- **WebSocket Message Relay**: Routes encrypted messages between clients using identity hashes.
+- **Offline Message Queue**: Temporarily stores messages in Redis for offline users with automatic 24h expiration.
+- **Public Key Storage**: Manages X3DH key bundles (identity keys, pre-keys, etc.).
+- **Nickname Registry**: Maps human-readable names to identity hashes with PoW-based anti-squatting.
+- **Account Deletion (Burn)**: Atomically purges all user data (keys, messages, nicknames) upon a signed burn request.
 
-### Core Functionality
-- **WebSocket Message Routing**: Routes encrypted messages to recipients using only cryptographic hash identifiers
-- **Offline Message Queue**: Stores messages in Redis for offline users with automatic deletion after delivery
-- **Public Key Storage**: Manages X3DH key bundles (identity keys, signed pre-keys, one-time pre-keys)
-- **Nickname Registry**: Maps human-readable names to identity hashes with PoW-based anti-squatting
-- **Session Tokens**: Issues reusable auth tokens to reduce repeated PoW challenges
-- **Account Deletion**: Atomically purges all user data (keys, messages, nicknames) on authenticated burn requests
-
-### Anti-Spam Protection
-- **Dynamic PoW**: SHA-256 challenges scale with server load and account age
-- **Rate Limiting**: Token-bucket (global) + sliding window (per-endpoint) limits
-- **Flood Protection**: Per-recipient message rate limits prevent targeted spam
-- **IP Blinding**: Logs use `HMAC(IP, Salt)` to enable abuse mitigation without tracking users
-
-### Privacy Features
-- **Traffic Padding**: All responses normalized to 1536 bytes to hide message sizes
-- **Timing Jitter**: Random 10-50ms delays prevent correlation attacks
-- **Dummy Packets**: Automatic background traffic maintains constant session profile
+### 🛡️ Aggressive Anti-Analysis & Security
+- **Dynamic Proof-of-Work (PoW)**: SHA-256 challenges scale difficulty based on server load and account maturity to prevent spam.
+- **Traffic Padding**: Every JSON response is normalized to exactly **1536 bytes** to hide message metadata.
+- **Timing Jitter**: Random **10-50ms delays** on delivery prevent correlation attacks at network boundaries.
+- **Dummy Pacing**: Automatic background traffic maintains a constant traffic profile even when the user is idle.
+- **Token-Bucket Rate Limiting**: Global (per-IP) and per-identity limits backed by Redis-Lua GCRA scripts.
+- **IP Blinding**: Logs and rate-limit keys use `HMAC(IP, ServerSalt)` to protect user privacy from the operator.
 
 ---
 
 ## 🛠️ Technical Stack
 
-- **Language**: C++23 with Boost.Asio (event-driven I/O)
-- **Protocols**: HTTP/REST + WebSockets over TLS 1.2+
-- **Storage**: Redis 6+ (Pub/Sub for distributed routing + volatile message queues)
-- **Crypto**: OpenSSL 3.0+ (Ed25519 verification, SHA-256)
-- **Security**: Forward-secret TLS ciphers, HSTS/CSP headers, recursive JSON depth limits
-
-### How It Works
-1. Clients connect via WebSocket and authenticate with PoW or session tokens
-2. Messages arrive as JSON envelopes with a recipient hash
-3. Server routes to local connections or publishes to Redis for cross-instance delivery
-4. Offline messages stored in Redis lists with TTL, deleted immediately after retrieval
-5. All traffic padded and jittered to resist metadata analysis
+- **Language**: C++20/C++23
+- **Primary Framework**: [Boost.Asio](https://www.boost.org/doc/libs/release/libs/asio/) & [Boost.Beast](https://www.boost.org/doc/libs/release/libs/beast/) (Event-driven I/O)
+- **Networking**: WebSockets + HTTP/REST over TLS 1.2+ (OpenSSL 3.0+)
+- **Storage**: Redis 6.2+ (using `redis-plus-plus` for Pub/Sub and volatile state)
+- **JSON**: Boost.JSON with recursion depth protection
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Getting Started
 
 ### 1. Prerequisites
-- **GCC 13+** or **Clang 16+**
-- **Boost** 1.75+
-- **OpenSSL** 3.0+
-- **Redis** 6+
+- **Compiler**: GCC 13+ or Clang 16+
+- **Build System**: CMake 3.20+
+- **Libraries**:
+  - **Boost** 1.83+ (system, thread, json)
+  - **OpenSSL** 3.0+
+  - **hiredis** & **redis-plus-plus** (Redis C++ client)
 
-### 2. Build
+### 2. Build Instructions
 ```bash
-git clone https://github.com/Moyzy/entropy.git
-cd entropy/server
+git clone https://github.com/entropy-messenger/entropy-server.git
+cd server
 mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake ..
 make -j$(nproc)
 ```
 
-### 3. Deploy (Docker)
+### 3. Quick Run (Development)
 ```bash
-export ENTROPY_SECRET_SALT=$(openssl rand -hex 32)
-docker-compose up -d
+# Run with default settings
+export ENTROPY_SECRET_SALT="super_secret_deployment_salt"
+./server
 ```
 
 ---
 
 ## ⚙️ Configuration
 
-Set these environment variables before launching:
+The server is configured via environment variables:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `ENTROPY_PORT` | Port to listen on | `8080` |
-| `ENTROPY_SECRET_SALT`| **CRITICAL**: The salt used for routing obfuscation. | (Required) |
+| `ENTROPY_SECRET_SALT` | **CRITICAL**: The salt used for routing/IP obfuscation. | (Required) |
 | `ENTROPY_REDIS_URL` | Redis connection endpoint | `tcp://127.0.0.1:6379` |
-| `ENTROPY_ALLOWED_ORIGINS`| CORS origin policy | `*` |
+| `ENTROPY_ALLOWED_ORIGINS`| CORS origin policy (comma-separated) | `localhost,tauri://` |
+| `ENTROPY_ADMIN_TOKEN` | Token for `/stats` and `/metrics` access | (None) |
+| `ENTROPY_MAX_CONNS_PER_IP`| Max WebSocket connections per IP address | `10` |
 
----
+### Tuning Rate Limits
+You can override default rate limits (hits per 60s) via:
+- `ENTROPY_LIMIT_GLOBAL`: Global request limit per IP.
+- `ENTROPY_LIMIT_RELAY`: Message relay frequency.
+- `ENTROPY_LIMIT_KEYS_UPLOAD`: Identity bundle upload frequency.
+- `ENTROPY_LIMIT_NICK_REGISTER`: Nickname registration frequency.
 
 ---
 
 ## 📄 License
 
 This project is licensed under the **AGPLv3**.
-
----
-

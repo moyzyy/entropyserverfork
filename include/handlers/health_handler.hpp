@@ -43,4 +43,4 @@ private:
     }
 };
 
-} // namespace entropy
+} 

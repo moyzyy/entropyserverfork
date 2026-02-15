@@ -9,16 +9,10 @@
 
 namespace entropy {
 
-
-
-
-
-
 bool IdentityHandler::validate_pow_msg(const json::object& obj, const std::string& remote_addr, int target_difficulty, const std::string& context) {
     if (!obj.contains("seed") || !obj.contains("nonce")) {
         return false;
     }
-    
     std::string seed;
     if (obj.at("seed").is_string()) seed = std::string(obj.at("seed").as_string());
     
@@ -51,7 +45,7 @@ json::object IdentityHandler::handle_pow_challenge_ws(const json::object& req, c
     int difficulty = PoWVerifier::get_required_difficulty(intensity_penalty, age);
     
     if (req.contains("nickname") && req.at("nickname").is_string()) {
-        std::string nick = std::string(req.at("nickname").as_string());
+        std::string nick = InputValidator::sanitize_field(std::string(req.at("nickname").as_string()), 32);
         difficulty = PoWVerifier::get_difficulty_for_nickname(nick, intensity_penalty, age);
     }
 
@@ -83,7 +77,6 @@ json::object IdentityHandler::handle_keys_upload_ws(const json::object& req, con
         return err;
     }
 
-    // Logic for saving the bundle
     try {
         key_storage_.store_bundle(id_hash, json::serialize(req));
         json::object response;
@@ -107,7 +100,6 @@ json::object IdentityHandler::handle_keys_fetch_ws(const json::object& req, cons
 
     std::string target_hash = std::string(req.at("target_hash").as_string());
     
-    // Check if it's a batch request (comma separated)
     std::vector<std::string> user_hashes;
     if (target_hash.find(',') != std::string::npos) {
         std::stringstream ss(target_hash);
@@ -166,7 +158,6 @@ json::object IdentityHandler::handle_keys_random_ws(const json::object& req, con
     response["type"] = "fetch_key_random_res";
     if (req.contains("req_id")) response["req_id"] = req.at("req_id");
 
-    // Random fetch doesn't require PoW, but is rate-limited
     int count = 5;
     if (req.contains("count") && req.at("count").is_number()) count = (int)req.at("count").as_int64();
     if (count < 1) count = 1;
@@ -188,8 +179,15 @@ json::object IdentityHandler::handle_nickname_register_ws(const json::object& re
         return err;
     }
     
-    std::string nick = std::string(req.at("nickname").as_string());
-    if (!validate_pow_msg(req, remote_addr, -1, nick)) { // difficulty is auto-calculated usually
+    std::string nick = InputValidator::sanitize_field(std::string(req.at("nickname").as_string()), 32);
+    if (nick.empty()) {
+        json::object err; err["type"] = "error";
+        if (req.contains("req_id")) err["req_id"] = req.at("req_id");
+        err["message"] = "Invalid nickname";
+        return err;
+    }
+    
+    if (!validate_pow_msg(req, remote_addr, -1, nick)) { 
         json::object err; err["type"] = "error";
         if (req.contains("req_id")) err["req_id"] = req.at("req_id");
         err["message"] = "Invalid PoW for nickname registration";
@@ -198,7 +196,6 @@ json::object IdentityHandler::handle_nickname_register_ws(const json::object& re
 
     std::string identity_hash = std::string(req.at("identity_hash").as_string());
     
-    // Simple registration for now
     if (redis_.register_nickname(nick, identity_hash)) {
         json::object response;
         response["type"] = "nickname_register_res";
@@ -221,7 +218,14 @@ json::object IdentityHandler::handle_nickname_lookup_ws(const json::object& req,
         return err;
     }
     
-    std::string name = std::string(req.at("name").as_string());
+    std::string name = InputValidator::sanitize_field(std::string(req.at("name").as_string()), 32);
+    if (name.empty()) {
+        json::object err; err["type"] = "error";
+        if (req.contains("req_id")) err["req_id"] = req.at("req_id");
+        err["message"] = "Invalid lookup name";
+        return err;
+    }
+    
     std::string h = redis_.resolve_nickname(name);
     
     json::object response;
@@ -253,7 +257,6 @@ json::object IdentityHandler::handle_account_burn_ws(const json::object& req, co
         return response;
     }
 
-    // Attempt to decode signature (Hex or Base64)
     std::string sig_str = std::string(req.at("signature").as_string());
     std::vector<unsigned char> sig_bytes;
     
@@ -279,7 +282,6 @@ json::object IdentityHandler::handle_account_burn_ws(const json::object& req, co
     std::string payload = "BURN_ACCOUNT:" + id_hash;
     std::vector<unsigned char> msg_bytes(payload.begin(), payload.end());
 
-    // Check for public_key or identityKey
     std::string pk_str;
     if (req.contains("public_key")) pk_str = std::string(req.at("public_key").as_string());
     else if (req.contains("identityKey")) pk_str = std::string(req.at("identityKey").as_string());
@@ -294,7 +296,6 @@ json::object IdentityHandler::handle_account_burn_ws(const json::object& req, co
             pubkey_bytes.push_back(std::stoi(pk_str.substr(i, 2), nullptr, 16));
         }
     } else if (pk_str.length() == 66 && InputValidator::is_valid_hex(pk_str)) {
-         // Signal/Entropy 33-byte key (starts with 05)
          for (size_t i = 0; i < 66; i += 2) {
             pubkey_bytes.push_back(std::stoi(pk_str.substr(i, 2), nullptr, 16));
         }
@@ -321,15 +322,11 @@ json::object IdentityHandler::handle_account_burn_ws(const json::object& req, co
         return response;
     }
 
-    // Verify ownership
     if (!InputValidator::verify_xeddsa(pubkey_bytes, msg_bytes, sig_bytes) && 
         !InputValidator::verify_ed25519(pubkey_bytes, msg_bytes, sig_bytes)) {
         response["message"] = "Invalid signature - ownership proof failed";
         return response;
     }
-
-    // Final verification: does the public key match the identity hash?
-    // (Implementation depends on system specifics, but usually SHA256)
     
     redis_.burn_account(id_hash);
 
@@ -379,4 +376,4 @@ json::object IdentityHandler::handle_link_preview_ws(const json::object& req, co
     return response;
 }
 
-} // namespace entropy
+} 

@@ -18,6 +18,7 @@ TEST_F(TimingTest, MessageDeliveryJitter) {
         boost::asio::io_context ioc;
         ConnectionManager cm{"time_salt"};
         RedisManager redis{config, cm, "time_salt"};
+        redis.set_blocking_executor(ioc.get_executor());
         RateLimiter rate_limiter{redis};
         MessageRelay relay{cm, redis, rate_limiter, config};
         auto alice = std::make_shared<WebSocketSession>(boost::beast::tcp_stream(ioc), cm, config);
@@ -33,10 +34,10 @@ TEST_F(TimingTest, MessageDeliveryJitter) {
         msg["to"] = bob_hash;
         msg["body"] = "test";
         relay.relay_message(json::serialize(msg), alice);
-        size_t processed = ioc.run_one();
+        size_t processed = ioc.run();
         auto end = std::chrono::steady_clock::now();
         auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-        EXPECT_EQ(processed, 1);
+        EXPECT_GE(processed, 1);
         EXPECT_GE(delay, 9);
         EXPECT_LE(delay, 100);
     }
