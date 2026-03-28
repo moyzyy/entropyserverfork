@@ -4,17 +4,10 @@ use std::cmp::max;
 pub struct PoWVerifier;
 
 impl PoWVerifier {
-    pub const BASE_DIFFICULTY: i32 = 4;
+    pub const BASE_DIFFICULTY: i32 = 8;
 
-    pub fn get_required_difficulty(active_connections: usize, intensity_penalty: i32, account_age_sec: i64) -> i32 {
+    pub fn get_required_difficulty(active_connections: usize, intensity_penalty: i32) -> i32 {
         let mut base = Self::BASE_DIFFICULTY + intensity_penalty;
-
-        // Reward long-term accounts
-        if account_age_sec > 15552000 { // 180 days
-            base -= 2;
-        } else if account_age_sec > 2592000 { // 30 days
-            base -= 1;
-        }
 
         // Ensure difficulty never drops below a safe minimum
         base = max(Self::BASE_DIFFICULTY - 2, base);
@@ -30,8 +23,8 @@ impl PoWVerifier {
         base
     }
 
-    pub fn get_difficulty_for_nickname(nickname: &str, active_connections: usize, intensity_penalty: i32, account_age_sec: i64) -> i32 {
-        let base = Self::get_required_difficulty(active_connections, intensity_penalty, account_age_sec);
+    pub fn get_difficulty_for_nickname(nickname: &str, active_connections: usize, intensity_penalty: i32) -> i32 {
+        let base = Self::get_required_difficulty(active_connections, intensity_penalty);
         if nickname.len() <= 5 {
             return base + 3;
         }
@@ -50,7 +43,7 @@ impl PoWVerifier {
         }
 
         if target_difficulty == -1 {
-            target_difficulty = Self::get_required_difficulty(0, 0, 0); // Match C++ default
+            target_difficulty = Self::get_required_difficulty(0, 0); // Match C++ default
         }
 
         let mut hasher = Sha256::new();

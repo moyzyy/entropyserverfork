@@ -27,28 +27,20 @@ impl Registry {
         format!("{:x}", hasher.finalize())
     }
 
-    pub fn add_connection(&self, user_id: &str, sender: MessageSender) {
-        let blinded = self.blind_id(user_id);
-        self.connections.insert(blinded, sender);
+    pub fn add_connection(&self, blinded_id: String, sender: MessageSender) {
+        self.connections.insert(blinded_id, sender);
     }
 
-    pub fn remove_connection(&self, user_id: &str) {
-        let blinded = self.blind_id(user_id);
-        self.connections.remove(&blinded);
+    pub fn remove_connection(&self, blinded_id: &str) {
+        self.connections.remove(blinded_id);
     }
 
-    pub fn get_connection(&self, user_id: &str) -> Option<MessageSender> {
-        let blinded = self.blind_id(user_id);
-        self.connections.get(&blinded).map(|s| s.clone())
-    }
-
-    pub fn get_connection_by_blinded_id(&self, blinded_id: &str) -> Option<MessageSender> {
+    pub fn get_connection(&self, blinded_id: &str) -> Option<MessageSender> {
         self.connections.get(blinded_id).map(|s| s.clone())
     }
 
-    pub fn increment_ip_count(&self, ip: &str, limit: usize) -> bool {
-        let blinded = self.blind_id(ip);
-        let mut entry = self.ip_counts.entry(blinded).or_insert(0);
+    pub fn increment_ip_count(&self, blinded_ip: &str, limit: usize) -> bool {
+        let mut entry = self.ip_counts.entry(blinded_ip.to_string()).or_insert(0);
         if *entry >= limit {
             return false;
         }
@@ -56,15 +48,14 @@ impl Registry {
         true
     }
 
-    pub fn decrement_ip_count(&self, ip: &str) {
-        let blinded = self.blind_id(ip);
-        if let Some(mut entry) = self.ip_counts.get_mut(&blinded) {
+    pub fn decrement_ip_count(&self, blinded_ip: &str) {
+        if let Some(mut entry) = self.ip_counts.get_mut(blinded_ip) {
             if *entry > 0 {
                 *entry -= 1;
             }
             if *entry == 0 {
                 drop(entry);
-                self.ip_counts.remove(&blinded);
+                self.ip_counts.remove(blinded_ip);
             }
         }
     }

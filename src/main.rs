@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(Registry::new(config.secret_salt.clone()));
     let redis = RedisManager::new(&config, registry.clone()).await?;
     let relay = Arc::new(MessageRelay::new(registry.clone(), redis.clone(), config.clone(), metrics.clone()));
-    let identity_handler = Arc::new(IdentityHandler::new(redis.clone(), registry.clone()));
+    let identity_handler = Arc::new(IdentityHandler::new(redis.clone(), registry.clone(), config.clone()));
     let health_handler = Arc::new(HealthHandler::new(config.clone(), registry.clone(), metrics.clone()));
 
     let state = Arc::new(AppState {
@@ -74,14 +74,6 @@ async fn main() -> anyhow::Result<()> {
     info!("Entropy Server (Rust) starting on {}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    
-    // 5-minute cleanup timer (1-to-1 parity)
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(300));
-        loop {
-            interval.tick().await;
-        }
-    });
 
     let server = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>());
     
@@ -118,6 +110,11 @@ async fn global_rate_limit_middleware(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    let path = request.uri().path();
+    if path == "/health" || path == "/stats" || path == "/metrics" {
+        return next.run(request).await;
+    }
+
     let b_ip = state.registry.blind_id(&addr.ip().to_string());
     let limit_res = state.redis.check_rate_limit(&format!("global:{}", b_ip), state.config.global_rate_limit as i64, 10, 1).await;
     

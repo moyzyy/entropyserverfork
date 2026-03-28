@@ -24,6 +24,8 @@ pub enum EventType {
     ReplayAttempt,
     SuspiciousActivity,
     ConnectionRejected,
+    ConnectionAbandoned,
+    ProtocolViolation,
 }
 
 pub struct SecurityLogger;
@@ -99,6 +101,8 @@ impl SecurityLogger {
             EventType::ReplayAttempt => "ReplayAttempt",
             EventType::SuspiciousActivity => "SUSPICIOUS",
             EventType::ConnectionRejected => "CONN_REJECTED",
+            EventType::ConnectionAbandoned => "CONN_ABANDONED",
+            EventType::ProtocolViolation => "PROTO_VIOLATION",
         };
 
         let sanitized_msg = Self::sanitize_log_message(message);
