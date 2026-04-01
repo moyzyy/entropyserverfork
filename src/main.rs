@@ -1,11 +1,13 @@
 use axum::{
-    routing::{get},
+    routing::get,
     Router,
     middleware::{self, Next},
-    response::{Response, IntoResponse},
-    http::{HeaderMap},
-    extract::{State, ConnectInfo},
+    response::Response,
+    http::{HeaderMap, StatusCode},
+    extract::State,
 };
+use tower_http::timeout::TimeoutLayer;
+use tower::ServiceBuilder;
 use std::sync::Arc;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -16,7 +18,7 @@ use crate::relay::MessageRelay;
 use crate::handlers::identity::IdentityHandler;
 use crate::handlers::health::HealthHandler;
 use crate::telemetry::metrics::Metrics;
-use tracing::{info, error};
+use tracing::info;
 
 mod config;
 mod db;
@@ -37,16 +39,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(ServerConfig::load());
     
-    // Match C++ strict security check
-    if config.secret_salt == "CHANGE_IN_PROD" {
-        error!("CRITICAL SECURITY ERROR: DEFAULT SECRET SALT DETECTED");
-        error!("Set 'ENTROPY_SECRET_SALT' environment variable immediately!");
-        std::process::exit(1);
-    }
-
     let metrics = Metrics::new();
-    let registry = Arc::new(Registry::new(config.secret_salt.clone()));
-    let redis = RedisManager::new(&config, registry.clone()).await?;
+    let registry = Arc::new(Registry::new());
+    let redis = RedisManager::new(config.clone(), registry.clone()).await?;
     let relay = Arc::new(MessageRelay::new(registry.clone(), redis.clone(), config.clone(), metrics.clone()));
     let identity_handler = Arc::new(IdentityHandler::new(redis.clone(), registry.clone(), config.clone()));
     let health_handler = Arc::new(HealthHandler::new(config.clone(), registry.clone(), metrics.clone()));
@@ -63,37 +58,28 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(|State(s): State<Arc<AppState>>| async move { s.health.handle_health().await }))
-        .route("/stats", get(|State(s): State<Arc<AppState>>, headers: HeaderMap, ConnectInfo(addr): ConnectInfo<SocketAddr>| async move { s.health.handle_stats(&headers, addr).await }))
-        .route("/metrics", get(|State(s): State<Arc<AppState>>, headers: HeaderMap, ConnectInfo(addr): ConnectInfo<SocketAddr>| async move { s.health.handle_metrics(&headers, addr).await }))
+        .route("/stats", get(|State(s): State<Arc<AppState>>, headers: HeaderMap| async move { s.health.handle_stats(&headers).await }))
+        .route("/metrics", get(|State(s): State<Arc<AppState>>, headers: HeaderMap| async move { s.health.handle_metrics(&headers).await }))
         .route("/ws", get(server::ws::ws_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), global_rate_limit_middleware))
-        .layer(middleware::from_fn_with_state(state.clone(), security_headers_middleware))
+        .layer(
+            ServiceBuilder::new()
+                .layer(tower::limit::ConcurrencyLimitLayer::new(config.max_global_connections))
+                .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(5)))
+                .layer(middleware::from_fn(security_headers_middleware))
+        )
         .with_state(state);
 
-    let addr: SocketAddr = format!("{}:{}", config.address, config.port).parse()?;
-    info!("Entropy Server (Rust) starting on {}", addr);
+    let addr: SocketAddr = format!("{}:{}", config.address, config.port).parse().expect("Invalid address");
+    info!("Entropy Server v0.1.0 starting on {}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await?;
-
-    let server = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>());
-    
-    // Graceful shutdown handling
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Shutdown signal received. Closing all connections...");
-            registry.close_all();
-        }
-        res = server => {
-            if let Err(e) = res {
-                error!("Server error: {}", e);
-            }
-        }
-    }
+    // IP-BLIND: We no longer need to extract connection info. 
+    // This removes the final dependency on network origin from the request lifecycle.
+    axum::serve(listener, app.into_make_service()).await?;
     
     Ok(())
 }
 
-#[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub registry: Arc<Registry>,
@@ -104,59 +90,14 @@ pub struct AppState {
     pub health: Arc<HealthHandler>,
 }
 
-async fn global_rate_limit_middleware(
-    state: axum::extract::State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    request: axum::http::Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    let path = request.uri().path();
-    if path == "/health" || path == "/stats" || path == "/metrics" {
-        return next.run(request).await;
-    }
 
-    let b_ip = state.registry.blind_id(&addr.ip().to_string());
-    let limit_res = state.redis.check_rate_limit(&format!("global:{}", b_ip), state.config.global_rate_limit as i64, 10, 1).await;
-    
-    if let Ok(res) = limit_res {
-        if !res.allowed {
-            state.metrics.increment_counter("global_limit_rejected", 1.0);
-            let mut response = axum::Json(serde_json::json!({
-                "error": "Rate limit exceeded",
-                "retry_after": res.reset_after_sec,
-                "limit": res.limit
-            })).into_response();
-            
-            *response.status_mut() = axum::http::StatusCode::TOO_MANY_REQUESTS;
-            let headers = response.headers_mut();
-            headers.insert("Retry-After", res.reset_after_sec.to_string().parse().unwrap());
-            headers.insert("X-RateLimit-Limit", res.limit.to_string().parse().unwrap());
-            headers.insert("X-RateLimit-Remaining", "0".parse().unwrap());
-            headers.insert("X-RateLimit-Reset", (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + res.reset_after_sec as u64).to_string().parse().unwrap());
-            
-            return response;
-        }
-    }
-    
-    next.run(request).await
-}
-
-async fn security_headers_middleware(
-    _state: axum::extract::State<Arc<AppState>>,
-    request: axum::http::Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    let mut response = next.run(request).await;
+async fn security_headers_middleware(req: axum::http::Request<axum::body::Body>, next: Next) -> Response {
+    let mut response = next.run(req).await;
     let headers = response.headers_mut();
-    
-    // Final 1-to-1 synchronized security headers
-    headers.insert("Server", "Entropy/2.0".parse().unwrap());
     headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
     headers.insert("X-Frame-Options", "DENY".parse().unwrap());
-    headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
     headers.insert("Strict-Transport-Security", "max-age=31536000; includeSubDomains".parse().unwrap());
     headers.insert("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'".parse().unwrap());
     headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
-    
     response
 }

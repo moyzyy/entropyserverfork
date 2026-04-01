@@ -5,7 +5,6 @@ use axum::{
     Json,
 };
 use std::sync::Arc;
-use std::net::SocketAddr;
 use crate::config::ServerConfig;
 use crate::server::registry::Registry;
 use crate::telemetry::metrics::Metrics;
@@ -33,9 +32,8 @@ impl HealthHandler {
         res
     }
 
-    pub async fn handle_stats(&self, headers: &HeaderMap, addr: SocketAddr) -> Response {
-        let is_local = addr.ip().is_loopback();
-        if !is_local && !self.verify_admin_request(headers) {
+    pub async fn handle_stats(&self, headers: &HeaderMap) -> Response {
+        if !self.verify_admin_request(headers) {
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
 
@@ -48,9 +46,8 @@ impl HealthHandler {
         res
     }
 
-    pub async fn handle_metrics(&self, headers: &HeaderMap, addr: SocketAddr) -> Response {
-        let is_local = addr.ip().is_loopback();
-        if !is_local && !self.verify_admin_request(headers) {
+    pub async fn handle_metrics(&self, headers: &HeaderMap) -> Response {
+        if !self.verify_admin_request(headers) {
              return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
 
@@ -58,9 +55,6 @@ impl HealthHandler {
         let mut res = body.into_response();
         
         res.headers_mut().insert("Content-Type", HeaderValue::from_static("text/plain; version=0.0.4"));
-        // C++ doesn't call add_security_headers for metrics in the code I saw, 
-        // but it's safer to leave it if it was there. 
-        // Re-checking C++: it DOES call add_security_headers(res) in handle_metrics.
         self.add_headers(res.headers_mut());
         res
     }

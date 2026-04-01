@@ -66,4 +66,25 @@ impl InputValidator {
         let sig = Signature::from_bytes(signature.try_into().unwrap_or(&[0;64]));
         key.verify(message, &sig).is_ok()
     }
+    pub fn get_json_depth(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut max = 0;
+                for val in map.values() {
+                    let d = Self::get_json_depth(val);
+                    if d > max { max = d; }
+                }
+                max + 1
+            }
+            serde_json::Value::Array(arr) => {
+                let mut max = 0;
+                for val in arr {
+                    let d = Self::get_json_depth(val);
+                    if d > max { max = d; }
+                }
+                max + 1
+            }
+            _ => 1,
+        }
+    }
 }

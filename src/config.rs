@@ -17,10 +17,8 @@ pub struct ServerConfig {
     
     // Resource Limits
     pub max_message_size: usize,
-    pub max_connections_per_ip: usize,
     pub max_global_connections: usize,
     pub connection_timeout_sec: u64,
-    pub websocket_ping_interval_sec: u64,
     pub session_ttl_sec: u64,
     
     // Rate Limiting
@@ -28,21 +26,17 @@ pub struct ServerConfig {
     pub rate_limit_burst: usize,
     
     // PoW
-    pub pow_rate_limit: i32,
     pub pow_base_difficulty: i32,
     
     // Redis-backed Window Limits
     pub global_rate_limit: i32,
     pub keys_upload_limit: i32,
     pub keys_fetch_limit: i32,
-    pub keys_random_limit: i32,
     pub relay_limit: i32,
     pub nick_register_limit: i32,
     pub nick_lookup_limit: i32,
     pub account_burn_limit: i32,
 
-    // Keys
-    pub secret_salt: String,
     pub admin_token: String,
     
     // CORS
@@ -63,11 +57,16 @@ pub struct ServerConfig {
     // VDF (Hardened)
     pub vdf_modulus: String,
     pub vdf_phi: String,
+    pub jail_duration_sec: u64,
+    pub violation_reset_sec: u64,
+    pub registration_intensity_low: u32,
+    pub registration_intensity_high: u32,
+    pub identity_violation_threshold: u64,
+    pub violation_jail_threshold: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PacingConfig {
-    pub idle_threshold_ms: u64,
     pub packet_size: usize,
     pub tick_interval_ms: u64,
 }
@@ -87,24 +86,21 @@ impl ServerConfig {
             cert_path: env::var("ENTROPY_CERT_PATH").expect("ENTROPY_CERT_PATH missing"),
             key_path: env::var("ENTROPY_KEY_PATH").expect("ENTROPY_KEY_PATH missing"),
             max_message_size: env::var("ENTROPY_MAX_MSG_SIZE").expect("ENTROPY_MAX_MSG_SIZE missing").parse().expect("Invalid size"),
-            max_connections_per_ip: env::var("ENTROPY_MAX_CONNS_PER_IP").expect("ENTROPY_MAX_CONNS_PER_IP missing").parse().expect("Invalid count"),
             max_global_connections: env::var("ENTROPY_MAX_GLOBAL_CONNS").expect("ENTROPY_MAX_GLOBAL_CONNS missing").parse().expect("Invalid count"),
             connection_timeout_sec: env::var("ENTROPY_CONN_TIMEOUT").expect("ENTROPY_CONN_TIMEOUT missing").parse().expect("Invalid timeout"),
-            websocket_ping_interval_sec: env::var("ENTROPY_WS_PING_INTERVAL").expect("ENTROPY_WS_PING_INTERVAL missing").parse().expect("Invalid interval"),
             session_ttl_sec: env::var("ENTROPY_SESSION_TTL").expect("ENTROPY_SESSION_TTL missing").parse().expect("Invalid TTL"),
+            jail_duration_sec: env::var("ENTROPY_JAIL_TTL").unwrap_or_else(|_| "300".to_string()).parse().expect("Invalid Jail TTL"),
+            violation_reset_sec: env::var("ENTROPY_VIOL_RESET").unwrap_or_else(|_| "3600".to_string()).parse().expect("Invalid Viol Reset TTL"),
             rate_limit_per_sec: env::var("ENTROPY_RATE_LIMIT").expect("ENTROPY_RATE_LIMIT missing").parse().expect("Invalid rate"),
             rate_limit_burst: env::var("ENTROPY_RATE_BURST").expect("ENTROPY_RATE_BURST missing").parse().expect("Invalid burst"),
-            pow_rate_limit: env::var("ENTROPY_POW_LIMIT").expect("ENTROPY_POW_LIMIT missing").parse().expect("Invalid limit"),
             pow_base_difficulty: env::var("ENTROPY_POW_BASE").expect("ENTROPY_POW_BASE missing").parse().expect("Invalid difficulty"),
             global_rate_limit: env::var("ENTROPY_LIMIT_GLOBAL").expect("ENTROPY_LIMIT_GLOBAL missing").parse().expect("Invalid limit"),
             keys_upload_limit: env::var("ENTROPY_LIMIT_KEYS_UPLOAD").expect("ENTROPY_LIMIT_KEYS_UPLOAD missing").parse().expect("Invalid limit"),
             keys_fetch_limit: env::var("ENTROPY_LIMIT_KEYS_FETCH").expect("ENTROPY_LIMIT_KEYS_FETCH missing").parse().expect("Invalid limit"),
-            keys_random_limit: env::var("ENTROPY_LIMIT_KEYS_RANDOM").expect("ENTROPY_LIMIT_KEYS_RANDOM missing").parse().expect("Invalid limit"),
             relay_limit: env::var("ENTROPY_LIMIT_RELAY").expect("ENTROPY_LIMIT_RELAY missing").parse().expect("Invalid limit"),
             nick_register_limit: env::var("ENTROPY_LIMIT_NICK_REGISTER").expect("ENTROPY_LIMIT_NICK_REGISTER missing").parse().expect("Invalid limit"),
             nick_lookup_limit: env::var("ENTROPY_LIMIT_NICK_LOOKUP").expect("ENTROPY_LIMIT_NICK_LOOKUP missing").parse().expect("Invalid limit"),
             account_burn_limit: env::var("ENTROPY_LIMIT_ACCOUNT_BURN").expect("ENTROPY_LIMIT_ACCOUNT_BURN missing").parse().expect("Invalid limit"),
-            secret_salt: env::var("ENTROPY_SECRET_SALT").expect("ENTROPY_SECRET_SALT missing"),
             admin_token: env::var("ENTROPY_ADMIN_TOKEN").expect("ENTROPY_ADMIN_TOKEN missing"),
             allowed_origins: env::var("ENTROPY_ALLOWED_ORIGINS").expect("ENTROPY_ALLOWED_ORIGINS missing").split(',').map(|s| s.to_string()).collect(),
             allowed_methods: vec!["GET".to_string(), "POST".to_string(), "OPTIONS".to_string()],
@@ -115,12 +111,15 @@ impl ServerConfig {
             max_json_depth: env::var("ENTROPY_MAX_JSON_DEPTH").expect("ENTROPY_MAX_JSON_DEPTH missing").parse().expect("Invalid depth"),
             max_offline_messages: env::var("ENTROPY_MAX_OFFLINE_MSGS").expect("ENTROPY_MAX_OFFLINE_MSGS missing").parse().expect("Invalid count"),
             pacing: PacingConfig {
-                idle_threshold_ms: env::var("ENTROPY_PACING_IDLE").expect("ENTROPY_PACING_IDLE missing").parse().expect("Invalid idle"),
                 packet_size: env::var("ENTROPY_PACING_SIZE").expect("ENTROPY_PACING_SIZE missing").parse().expect("Invalid size"),
                 tick_interval_ms: env::var("ENTROPY_PACING_TICK").expect("ENTROPY_PACING_TICK missing").parse().expect("Invalid tick"),
             },
             vdf_modulus: env::var("ENTROPY_VDF_MODULUS").expect("ENTROPY_VDF_MODULUS missing"),
             vdf_phi: env::var("ENTROPY_VDF_PHI").expect("ENTROPY_VDF_PHI missing"),
+            registration_intensity_low: env::var("ENTROPY_INTENSITY_LOW").unwrap_or_else(|_| "10".to_string()).parse().expect("Invalid intensity"),
+            registration_intensity_high: env::var("ENTROPY_INTENSITY_HIGH").unwrap_or_else(|_| "50".to_string()).parse().expect("Invalid intensity"),
+            identity_violation_threshold: env::var("ENTROPY_VIOL_LIMIT").unwrap_or_else(|_| "3".to_string()).parse().expect("Invalid violation limit"),
+            violation_jail_threshold: env::var("ENTROPY_VIOL_THRESHOLD").unwrap_or_else(|_| "5".to_string()).parse().expect("Invalid threshold"),
         }
     }
 }

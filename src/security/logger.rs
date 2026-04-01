@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use sha2::{Sha256, Digest};
+use std::time::Instant;
 use rand::{thread_rng, RngCore};
 use once_cell::sync::Lazy;
 use chrono::Utc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)]
 pub enum LogLevel {
     INFO,
     WARNING,
@@ -28,14 +28,17 @@ pub enum EventType {
     ProtocolViolation,
 }
 
+#[allow(dead_code)]
 pub struct SecurityLogger;
 
+#[allow(dead_code)]
 struct LoggerState {
     min_level: LogLevel,
     log_salt: String,
     last_rotation: Instant,
 }
 
+#[allow(dead_code)]
 static STATE: Lazy<Arc<Mutex<LoggerState>>> = Lazy::new(|| {
     let min_level = match std::env::var("ENTROPY_LOG_LEVEL").unwrap_or_default().as_str() {
         "CRITICAL" => LogLevel::CRITICAL,
@@ -55,34 +58,20 @@ static STATE: Lazy<Arc<Mutex<LoggerState>>> = Lazy::new(|| {
     }))
 });
 
+#[allow(dead_code)]
 impl SecurityLogger {
-    pub fn log(level: LogLevel, event: EventType, remote_addr: &str, message: &str) {
-        let mut state = STATE.lock().unwrap();
+    pub fn log(level: LogLevel, event: EventType, id_hash: &str, message: &str) {
+        let state = STATE.lock().unwrap();
         
         if level < state.min_level {
             return;
         }
 
-        let now = Instant::now();
-        if now.duration_since(state.last_rotation) >= Duration::from_secs(24 * 3600) {
-            let mut salt_bytes = [0u8; 32];
-            thread_rng().fill_bytes(&mut salt_bytes);
-            state.log_salt = hex::encode(salt_bytes);
-            state.last_rotation = now;
-            
-            // Log rotation info
-            if LogLevel::INFO >= state.min_level {
-                println!("[{} UTC] [INFO] [SECURITY] msg=\"IP blinding salt rotated for log forward secrecy (daily update)\"", Utc::now().format("%Y-%m-%d %H:%M:%S"));
-            }
-        }
-
-        let mut hidden_ip = remote_addr.to_string();
-        if remote_addr != "unknown" && remote_addr != "internal" && remote_addr != "SYSTEM" {
-            let mut hasher = Sha256::new();
-            hasher.update(remote_addr.as_bytes());
-            hasher.update(state.log_salt.as_bytes());
-            let hash = hasher.finalize();
-            hidden_ip = format!("anon_{}", hex::encode(&hash[0..6]));
+        let mut display_id = id_hash.to_string();
+        if id_hash != "unknown" && id_hash != "internal" && id_hash != "SYSTEM" {
+            // Truncate the 64-char hash for cleaner logging while preserving identity
+            let len = id_hash.len().min(8);
+            display_id = format!("id_{}", &id_hash[0..len]);
         }
 
         let level_str = match level {
@@ -94,7 +83,7 @@ impl SecurityLogger {
 
         let event_str = match event {
             EventType::AuthSuccess => "AUTH_SUCCESS",
-            EventType::AuthFailure => "AuthFailure",
+            EventType::AuthFailure => "Auth_Failure",
             EventType::RateLimitHit => "RATE_LIMIT",
             EventType::InvalidInput => "InvalidInput",
             EventType::PowFailure => "PowFailure",
@@ -106,11 +95,11 @@ impl SecurityLogger {
         };
 
         let sanitized_msg = Self::sanitize_log_message(message);
-        let log_line = format!("[{} UTC] [{}] [{}] ip={} msg=\"{}\"", 
+        let log_line = format!("[{} UTC] [{}] [{}] {} msg=\"{}\"", 
             Utc::now().format("%Y-%m-%d %H:%M:%S"),
             level_str,
             event_str,
-            hidden_ip,
+            display_id,
             sanitized_msg
         );
 

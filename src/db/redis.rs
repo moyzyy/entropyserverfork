@@ -1,4 +1,4 @@
-use redis::{AsyncCommands, Client};
+use redis::AsyncCommands;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use crate::config::ServerConfig;
@@ -15,16 +15,18 @@ pub struct RateLimitResult {
     pub current: i64,
     pub limit: i64,
     pub reset_after_sec: i64,
+    pub is_jailed: bool,
 }
 
 pub struct RedisManager {
     client: redis::Client,
     connection: redis::aio::MultiplexedConnection,
     registry: Arc<Registry>,
+    config: Arc<ServerConfig>,
 }
 
 impl RedisManager {
-    pub async fn new(config: &ServerConfig, registry: Arc<Registry>) -> Result<Arc<Self>> {
+    pub async fn new(config: Arc<ServerConfig>, registry: Arc<Registry>) -> Result<Arc<Self>> {
         let client = redis::Client::open(config.redis_url.clone())?;
         let connection = client.get_multiplexed_async_connection().await?;
         
@@ -32,6 +34,7 @@ impl RedisManager {
             client,
             connection,
             registry,
+            config: config.clone(),
         });
 
         let manager_clone = manager.clone();
@@ -58,9 +61,9 @@ impl RedisManager {
                 let channel: String = msg.get_channel_name().to_string();
                 
                 if channel.starts_with("relay:") {
-                    let blinded_id = &channel[6..];
+                    let id_hash = &channel[6..];
                     let payload: Vec<u8> = msg.get_payload().unwrap_or_default();
-                    if let Some(sender) = registry_clone.get_connection(blinded_id) {
+                    if let Some(sender) = registry_clone.get_connection(id_hash) {
                         let _ = sender.send(crate::relay::QueuedMessage {
                             msg: axum::extract::ws::Message::Binary(payload.into()),
                         });
@@ -73,7 +76,6 @@ impl RedisManager {
     pub async fn check_rate_limit(&self, key: &str, limit: i64, window_sec: i64, cost: i64) -> Result<RateLimitResult> {
         let mut conn = self.connection.clone();
         
-        // Match C++ GCRA (Generic Cell Rate Algorithm) with jail/violation tracking
         let script = redis::Script::new(r"
             local key = KEYS[1]
             local rate = tonumber(ARGV[1])
@@ -81,6 +83,8 @@ impl RedisManager {
             local period = tonumber(ARGV[3])
             local now = tonumber(ARGV[4])
             local cost = tonumber(ARGV[5])
+            local jail_duration = tonumber(ARGV[6])
+            local violation_threshold = tonumber(ARGV[7])
             
             local emission_interval = period / burst
             local jail_key = key .. ':jail'
@@ -103,9 +107,9 @@ impl RedisManager {
                 local viol = redis.call('INCR', violation_key)
                 if viol == 1 then redis.call('EXPIRE', violation_key, period * 2) end
                 
-                if viol > 5 then
-                    redis.call('SETEX', jail_key, 300, 'banned')
-                    return {-1, 0, 300}
+                if viol > violation_threshold then
+                    redis.call('SETEX', jail_key, jail_duration, 'banned')
+                    return {-1, 0, jail_duration}
                 end
                 
                 return {0, math.ceil(retry_after), 0}
@@ -123,14 +127,17 @@ impl RedisManager {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs_f64();
+        let jail_duration = self.config.jail_duration_sec;
 
         let result: Vec<i64> = script
             .key(key)
-            .arg((limit as f64) / (window_sec as f64))  // rate
-            .arg(limit)                                  // burst
-            .arg(window_sec)                             // period
-            .arg(now)                                    // now
-            .arg(cost)                                   // cost
+            .arg((limit as f64) / (window_sec as f64))
+            .arg(limit)
+            .arg(window_sec)
+            .arg(now)
+            .arg(cost)
+            .arg(jail_duration)
+            .arg(self.config.violation_jail_threshold)
             .invoke_async(&mut conn)
             .await?;
 
@@ -145,6 +152,7 @@ impl RedisManager {
                     current: limit - val1,
                     limit,
                     reset_after_sec: 0,
+                    is_jailed: false,
                 })
             } else if status == -1 {
                 Ok(RateLimitResult {
@@ -152,13 +160,23 @@ impl RedisManager {
                     current: limit,
                     limit,
                     reset_after_sec: val2,
+                    is_jailed: true,
                 })
             } else {
+                let current = (limit as i64).saturating_sub(val1); 
+                
+                if key.starts_with("limit:relay:uid:") {
+                    let viol_key = format!("{}:viol", key);
+                    let _: () = redis::cmd("INCR").arg(&viol_key).query_async(&mut conn).await.unwrap_or_default();
+                    let _: () = redis::cmd("EXPIRE").arg(&viol_key).arg(self.config.violation_reset_sec).query_async(&mut conn).await.unwrap_or_default();
+                }
+
                 Ok(RateLimitResult {
                     allowed: false,
-                    current: limit,
+                    current,
                     limit,
-                    reset_after_sec: val1,
+                    reset_after_sec: val2,
+                    is_jailed: false,
                 })
             }
         } else {
@@ -167,49 +185,53 @@ impl RedisManager {
                 current: 0,
                 limit,
                 reset_after_sec: 0,
+                is_jailed: false,
             })
         }
     }
 
-    pub async fn publish_message(&self, blinded_recipient: &str, message: &[u8]) -> Result<()> {
+    pub async fn penalize_uid(&self, user_hash: &str, duration_sec: u64) -> Result<()> {
         let mut conn = self.connection.clone();
-        let channel = format!("relay:{}", blinded_recipient);
+        let jail_key = format!("limit:relay:uid:{}:jail", user_hash);
+        let _: () = conn.set_ex(&jail_key, "banned", duration_sec).await?;
+        Ok(())
+    }
+
+    pub async fn publish_message(&self, recipient_hash: &str, message: &[u8]) -> Result<()> {
+        let mut conn = self.connection.clone();
+        let channel = format!("relay:{}", recipient_hash);
         let _: () = conn.publish(channel, message).await?;
         Ok(())
     }
 
-    pub async fn publish_multicast(&self, blinded_recipients: &Vec<String>, message: &str) -> Result<()> {
+    pub async fn publish_multicast(&self, recipient_hashes: &Vec<String>, message: &str) -> Result<()> {
         let mut conn = self.connection.clone();
-        for blinded in blinded_recipients {
-            let channel = format!("relay:{}", blinded);
+        for hash in recipient_hashes {
+            let channel = format!("relay:{}", hash);
             let _: () = conn.publish(channel, message).await?;
         }
         Ok(())
     }
 
-    pub async fn store_offline_message(&self, blinded_recipient: &str, message: &[u8], limit: usize) -> Result<bool> {
+    pub async fn store_offline_message(&self, recipient_hash: &str, message: &[u8], limit: usize) -> Result<bool> {
         let mut conn = self.connection.clone();
-        let key = format!("msg:{}", blinded_recipient);
-        
+        let key = format!("msg:{}", recipient_hash);
         let _: () = conn.lpush(&key, message).await?;
         let _: () = conn.ltrim(&key, -(limit as isize), -1).await?;
         let _: () = conn.expire(&key, 86400).await?;
-        
         Ok(true)
     }
 
-    pub async fn get_offline_count(&self, blinded_recipient: &str) -> Result<u64> {
+    pub async fn get_offline_count(&self, recipient_hash: &str) -> Result<u64> {
         let mut conn = self.connection.clone();
-        let key = format!("msg:{}", blinded_recipient);
+        let key = format!("msg:{}", recipient_hash);
         let len: u64 = conn.llen(&key).await?;
         Ok(len)
     }
 
-    pub async fn retrieve_offline_messages(&self, blinded_recipient: &str) -> Result<Vec<Vec<u8>>> {
+    pub async fn get_offline_messages(&self, recipient_hash: &str) -> Result<Vec<Vec<u8>>> {
         let mut conn = self.connection.clone();
-        let key = format!("msg:{}", blinded_recipient);
-        
-        // Match C++ atomic pop script
+        let key = format!("msg:{}", recipient_hash);
         let script = redis::Script::new(r"
             local msgs = redis.call('LRANGE', KEYS[1], 0, -1)
             if #msgs > 0 then
@@ -217,81 +239,79 @@ impl RedisManager {
             end
             return msgs
         ");
-        
         let messages: Vec<Vec<u8>> = script.key(key).invoke_async(&mut conn).await?;
         Ok(messages)
     }
 
-    pub async fn subscribe_user(&self, _user_hash: &str) -> Result<()> {
-        Ok(())
-    }
+    pub async fn subscribe_user(&self, _user_hash: &str) -> Result<()> { Ok(()) }
+    pub async fn unsubscribe_user(&self, _user_hash: &str) -> Result<()> { Ok(()) }
 
-    pub async fn unsubscribe_user(&self, _user_hash: &str) -> Result<()> {
-        Ok(())
-    }
-
-    pub async fn store_user_bundle(&self, user_hash: &str, blinded_user_hash: &str, bundle_json: &str) -> Result<()> {
+    pub async fn store_user_bundle(&self, user_hash: &str, bundle_json: &str) -> Result<()> {
         let mut conn = self.connection.clone();
-        let key = format!("keys:{}", blinded_user_hash);
-        
-        // Match C++: SET, EXPIRE 30 days
+        let key = format!("keys:{}", user_hash);
         let _: () = conn.set(&key, bundle_json).await?;
         let _: () = conn.expire(&key, 2592000).await?;
-        
-        // Track in active_users set
         let _: () = conn.sadd("active_users", user_hash).await?;
         let _: () = conn.expire("active_users", 2592000).await?;
-        
-        self.mark_id_seen(user_hash, blinded_user_hash).await?;
+        self.mark_id_seen(user_hash).await?;
         Ok(())
     }
 
-    pub async fn get_user_bundle(&self, blinded_user_hash: &str) -> Result<Option<String>> {
+    pub async fn get_user_bundle(&self, user_hash: &str) -> Result<Option<String>> {
         let mut conn = self.connection.clone();
-        let key = format!("keys:{}", blinded_user_hash);
+        let key = format!("keys:{}", user_hash);
         let val: Option<String> = conn.get(&key).await?;
         Ok(val)
     }
 
-    pub async fn get_random_user_hashes(&self, count: usize) -> Result<Vec<String>> {
+    pub async fn store_otk_pool(&self, user_hash: &str, keys: Vec<String>) -> Result<()> {
         let mut conn = self.connection.clone();
-        let hashes: Vec<String> = redis::cmd("SRANDMEMBER")
-            .arg("active_users")
-            .arg(count as isize)
-            .query_async(&mut conn)
-            .await?;
-        Ok(hashes)
+        let key = format!("otk:{}", user_hash);
+        let current_count: u64 = conn.scard(&key).await?;
+        if current_count + (keys.len() as u64) > 100 {
+            return Err(anyhow::anyhow!("OTK pool limit exceeded (max 100)"));
+        }
+        let mut pipe = redis::pipe();
+        for k in keys { pipe.sadd(&key, k); }
+        pipe.expire(&key, 2592000);
+        let _: () = pipe.query_async(&mut conn).await?;
+        Ok(())
     }
 
-    pub async fn register_nickname(&self, nickname: &str, user_hash: &str, blinded_user_hash: &str) -> Result<bool> {
+    pub async fn pop_otk(&self, user_hash: &str) -> Result<Option<String>> {
         let mut conn = self.connection.clone();
-        let key = format!("nick:{}", nickname);
-        
-        // Match C++: SET NX, then check if same owner if failed
-        let success: bool = conn.set_nx(&key, user_hash).await?;
-        if !success {
-            let val: Option<String> = conn.get(&key).await?;
-            if let Some(owner) = val {
-                if owner == user_hash {
-                    let _: () = conn.expire(&key, 2592000).await?;
-                    return Ok(true);
-                }
+        let key = format!("otk:{}", user_hash);
+        let val: Option<String> = conn.spop(&key).await?;
+        Ok(val)
+    }
+
+    pub async fn get_otk_count(&self, user_hash: &str) -> Result<u32> {
+        let mut conn = self.connection.clone();
+        let key = format!("otk:{}", user_hash);
+        let count: u32 = conn.scard(&key).await?;
+        Ok(count)
+    }
+
+    pub async fn register_nickname(&self, nickname: &str, user_hash: &str) -> Result<bool> {
+        let mut conn = self.connection.clone();
+        let owner_key = format!("rn:{}", user_hash);
+        let existing_nick: Option<String> = conn.get(&owner_key).await?;
+        if let Some(ref old_name) = existing_nick {
+            if old_name == nickname {
+                let _: () = conn.expire(&format!("nick:{}", nickname), 2592000).await?;
+                let _: () = conn.expire(&owner_key, 2592000).await?;
+                return Ok(true);
             }
-            return Ok(false);
         }
-        
-        let _: () = conn.expire(&key, 2592000).await?;
-        
-        // Registration event for intensity tracking
-        let mut bytes = [0u8; 8];
-        thread_rng().fill_bytes(&mut bytes);
-        let event_id = hex::encode(bytes);
-        let _: () = conn.set_ex(format!("reg_event:{}", event_id), "1", 300).await?;
-        
-        // Reverse mapping for deletion
-        let _: () = conn.set_nx(format!("rn:{}", blinded_user_hash), nickname).await?;
-        let _: () = conn.expire(format!("rn:{}", blinded_user_hash), 2592000).await?;
-        
+        let new_key = format!("nick:{}", nickname);
+        let success: bool = conn.set_nx(&new_key, user_hash).await?;
+        if !success { return Ok(false); }
+        if let Some(old_name) = existing_nick {
+            let _: () = conn.del(&format!("nick:{}", old_name)).await?;
+        }
+        let _: () = conn.expire(&new_key, 2592000).await?;
+        let _: () = conn.set(&owner_key, nickname).await?;
+        let _: () = conn.expire(&owner_key, 2592000).await?;
         Ok(true)
     }
 
@@ -302,117 +322,97 @@ impl RedisManager {
         Ok(val)
     }
 
-    pub async fn mark_id_seen(&self, _user_hash: &str, blinded_user_hash: &str) -> Result<()> {
+    pub async fn get_nickname(&self, user_hash: &str) -> Result<Option<String>> {
         let mut conn = self.connection.clone();
-        let key = format!("seen:{}", blinded_user_hash);
+        let owner_key = format!("rn:{}", user_hash);
+        let nick: Option<String> = conn.get(&owner_key).await?;
+        Ok(nick)
+    }
+
+    pub async fn mark_id_seen(&self, user_hash: &str) -> Result<()> {
+        let mut conn = self.connection.clone();
+        let key = format!("seen:{}", user_hash);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let _: () = conn.set(key, now).await?;
+        let _: () = conn.set(&key, now).await?;
+        let _: () = conn.expire(&key, 2592000).await?;
         Ok(())
     }
 
-    pub async fn get_account_age(&self, blinded_user_hash: &str) -> Result<i64> {
+    pub async fn get_account_age(&self, user_hash: &str) -> Result<i64> {
         let mut conn = self.connection.clone();
-        let key = format!("seen:{}", blinded_user_hash);
+        let key = format!("seen:{}", user_hash);
         let val: Option<String> = conn.get(key).await?;
-        
         if let Some(first_seen_str) = val {
             let first_seen: i64 = first_seen_str.parse().unwrap_or(0);
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
             Ok(now - first_seen)
-        } else {
-            Ok(0)
-        }
+        } else { Ok(0) }
+    }
+
+    pub async fn get_identity_violations(&self, user_hash: &str) -> Result<u32> {
+        let mut conn = self.connection.clone();
+        let key = format!("limit:relay:uid:{}:viol", user_hash);
+        let res: Option<u32> = conn.get(&key).await?;
+        Ok(res.unwrap_or(0))
     }
 
     pub async fn get_registration_intensity(&self) -> Result<i32> {
         let mut conn = self.connection.clone();
-        // Match C++: SCAN for reg_event:*
         let mut cursor = 0i64;
         let mut keys = Vec::new();
         loop {
-            let (next_cursor, mut part_keys): (i64, Vec<String>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg("reg_event:*")
-                .arg("COUNT")
-                .arg(100)
-                .query_async(&mut conn).await?;
+            let (next_cursor, mut part_keys): (i64, Vec<String>) = redis::cmd("SCAN").arg(cursor).arg("MATCH").arg("reg_event:*").arg("COUNT").arg(100).query_async(&mut conn).await?;
             keys.append(&mut part_keys);
             cursor = next_cursor;
-            if cursor == 0 { break; }
-            // Increase batch limit to 500 for parity
-            if keys.len() >= 500 { break; } 
+            if cursor == 0 || keys.len() >= 500 { break; }
         }
         Ok(keys.len() as i32)
     }
 
-    pub async fn burn_account(&self, user_hash: &str, blinded_user_hash: &str) -> Result<bool> {
+    pub async fn nuclear_burn(&self, user_hash: &str) -> Result<bool> {
         let mut conn = self.connection.clone();
-        
-        // Match SPECS Section 5: Atomic Lua Script for "Nuclear Option"
-        let script = r#"
-            local blinded = ARGV[1]
-            local unblinded = ARGV[2]
-            
-            -- Remove primary data
-            redis.call('DEL', 'keys:' .. blinded)
-            redis.call('DEL', 'msg:' .. blinded)
-            redis.call('DEL', 'sess:' .. blinded)
-            redis.call('DEL', 'seen:' .. blinded)
-            
-            -- Remove nicknames
-            local nick = redis.call('GET', 'rn:' .. blinded)
-            if nick then
-                redis.call('DEL', 'nick:' .. nick)
-                redis.call('DEL', 'rn:' .. blinded)
-            end
-            
-            -- Remove from global discovery
-            redis.call('SREM', 'active_users', unblinded)
-            
+        let script = r"
+            local id = ARGV[1]
+            local nick = redis.call('GET', 'rn:' .. id)
+            if nick then redis.call('DEL', 'nick:' .. nick) end
+            redis.call('DEL', 'rn:' .. id)
+            redis.call('DEL', 'keys:' .. id)
+            redis.call('DEL', 'msg:' .. id)
+            redis.call('DEL', 'sess:' .. id)
+            redis.call('DEL', 'seen:' .. id)
+            redis.call('DEL', 'otk:' .. id)
+            redis.call('SREM', 'active_users', id)
             return 1
-        "#;
-        
-        let _: i32 = redis::Script::new(script)
-            .arg(blinded_user_hash)
-            .arg(user_hash)
-            .invoke_async(&mut conn).await?;
-            
-        tracing::info!("Nuclear burn completed for id={} blinded={}", user_hash, blinded_user_hash);
+        ";
+        let _: i32 = redis::Script::new(script).arg(user_hash).invoke_async(&mut conn).await?;
         Ok(true)
     }
 
-    pub async fn create_session_token(&self, blinded_user_hash: &str, ttl_sec: u64) -> Result<String> {
+    pub async fn create_session_token(&self, user_hash: &str, ttl_sec: u64) -> Result<String> {
         let mut conn = self.connection.clone();
         let mut bytes = [0u8; 32];
         thread_rng().fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
-        
-        let key = format!("sess:{}", blinded_user_hash);
+        let key = format!("sess:{}", user_hash);
         let _: () = conn.set_ex(&key, &token, ttl_sec).await?;
         Ok(token)
     }
 
-    pub async fn verify_session_token(&self, blinded_user_hash: &str, token: &str) -> Result<bool> {
+    pub async fn verify_session_token(&self, user_hash: &str, token: &str) -> Result<bool> {
         if token.is_empty() { return Ok(false); }
         let mut conn = self.connection.clone();
-        let key = format!("sess:{}", blinded_user_hash);
+        let key = format!("sess:{}", user_hash);
         let val: Option<String> = conn.get(&key).await?;
-        
-        if let Some(stored) = val {
-            // Match subtle comparison if possible or use constant_time_eq
-            Ok(Self::constant_time_eq(stored.as_bytes(), token.as_bytes()))
-        } else {
-            Ok(false)
+        if let Some(stored_token) = val {
+            return Ok(Self::constant_time_eq(stored_token.as_bytes(), token.as_bytes()));
         }
+        Ok(false)
     }
 
     fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         if a.len() != b.len() { return false; }
         let mut res = 0;
-        for (x, y) in a.iter().zip(b.iter()) {
-            res |= x ^ y;
-        }
+        for (x, y) in a.iter().zip(b.iter()) { res |= x ^ y; }
         res == 0
     }
 
