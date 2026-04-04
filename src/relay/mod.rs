@@ -59,7 +59,7 @@ impl MessageRelay {
         if !routing.valid || routing.to.is_empty() { return; }
 
         if let Some(recipient_tx) = self.registry.get_connection(&routing.to) {
-            let mut response = json!({ 
+            let response = json!({ 
                 "type": "text_msg", 
                 "sender": sender_hash, 
                 "payload": message_raw 
@@ -95,12 +95,13 @@ impl MessageRelay {
             };
             
             if recipient_tx.send(msg).is_ok() {
+                let transfer_id = u32::from_be_bytes(data[1..5].try_into().unwrap_or([0;4]));
                 let index = u32::from_be_bytes(data[5..9].try_into().unwrap_or([0;4]));
                 let total = u32::from_be_bytes(data[9..13].try_into().unwrap_or([1;4]));
                 
                 if index + 1 >= total {
                     if let Some(sender_tx) = self.registry.get_connection(sender_hash) {
-                        let mut response = json!({ "type": "relay_success", "status": "relayed" });
+                        let response = json!({ "type": "relay_success", "status": "relayed", "transfer_id": transfer_id });
                         let mut response_str = serde_json::to_string(&response).unwrap();
                         TrafficNormalizer::pad_json_str(&mut response_str, self.config.pacing.packet_size);
                         let _ = sender_tx.send(QueuedMessage {
@@ -110,38 +111,53 @@ impl MessageRelay {
                 }
             }
         } else {
-            // Recipient Offline: Store in Redis mailbox
-            let current_count = self.redis.get_offline_count(target_hash).await.unwrap_or(0);
-            if current_count >= self.config.max_offline_messages as u64 {
-                self.notify_error_direct(sender_hash, Some(target_hash), "storage_full", "Recipient offline storage is full").await;
+            let transfer_id = u32::from_be_bytes(data[1..5].try_into().unwrap_or([0;4]));
+            // Recipient Offline: Only buffer Type 0x01 (Signal/Text JSON), NEVER 0x02 (Media Binary)
+            if frame_type == 0x02 {
+                tracing::info!("[Relay] Rejecting Type 0x02 fragment: Receiver {} is offline.", target_hash);
+                self.notify_error_direct(sender_hash, Some(target_hash), "media_offline", "Recipient is offline. Media fragments were dropped.", Some(transfer_id)).await;
                 return;
             }
 
-            let _ = self.redis.publish_message(target_hash, &payload).await;
-            let _ = self.redis.store_offline_message(target_hash, &payload, self.config.max_offline_messages).await;
+            // Recipient Offline: Only store in Redis if they pass BOTH global and per-sender quotas
+            // All checks are now handled ATOMICALLY in the Lua script to prevent race conditions.
+            tracing::info!("[Relay] WRITING to Redis Mailbox: target={} type=0x{:02x} size={}", target_hash, frame_type, payload.len());
             
-            if let Some(sender_tx) = self.registry.get_connection(sender_hash) {
-                let mut response = json!({
-                    "type": "delivery_status",
-                    "target": target_hash,
-                    "status": "relayed"
-                });
-                let mut response_str = serde_json::to_string(&response).unwrap();
-                TrafficNormalizer::pad_json_str(&mut response_str, self.config.pacing.packet_size);
-                let _ = sender_tx.send(QueuedMessage {
-                    msg: axum::extract::ws::Message::Text(response_str.into()),
-                });
+            match self.redis.store_offline_message(target_hash, sender_hash, &payload, self.config.max_offline_messages, self.config.max_offline_messages_per_sender).await {
+                Ok(_) => {
+                    let _ = self.redis.publish_message(target_hash, &payload).await;
+                    if let Some(sender_tx) = self.registry.get_connection(sender_hash) {
+                        let response = json!({ "type": "delivery_status", "target": target_hash, "status": "relayed", "transfer_id": transfer_id });
+                        let mut response_str = serde_json::to_string(&response).unwrap();
+                        TrafficNormalizer::pad_json_str(&mut response_str, self.config.pacing.packet_size);
+                        let _ = sender_tx.send(QueuedMessage { msg: axum::extract::ws::Message::Text(response_str.into()) });
+                    }
+                },
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let (reason, msg): (&str, &str) = if err_str.contains("ERR_MAILBOX_FULL") {
+                        ("storage_full", "Recipient's mailbox is full (200/200).")
+                    } else if err_str.contains("ERR_SENDER_QUOTA") {
+                        ("sender_quota_exceeded", "You have reached your 5-message limit for this recipient.")
+                    } else {
+                        ("delivery_error", err_str.as_str())
+                    };
+                    
+                    tracing::warn!("[Relay] Rejecting message to {}: {}", target_hash, msg);
+                    self.notify_error_direct(sender_hash, Some(target_hash), reason, msg, Some(transfer_id)).await;
+                }
             }
         }
     }
 
-    async fn notify_error_direct(&self, sender_hash: &str, target_hash: Option<&str>, reason: &str, message: &str) {
+    async fn notify_error_direct(&self, sender_hash: &str, target_hash: Option<&str>, reason: &str, message: &str, transfer_id: Option<u32>) {
         if let Some(sender_tx) = self.registry.get_connection(sender_hash) {
-            let mut response = json!({
+            let response = json!({
                 "type": "delivery_error",
                 "reason": reason,
                 "message": message,
-                "target": target_hash
+                "target": target_hash,
+                "transfer_id": transfer_id
             });
             let mut response_str = serde_json::to_string(&response).unwrap();
             TrafficNormalizer::pad_json_str(&mut response_str, self.config.pacing.packet_size);

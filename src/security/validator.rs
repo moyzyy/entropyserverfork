@@ -87,4 +87,24 @@ impl InputValidator {
             _ => 1,
         }
     }
+
+    /// 🛡️ PRE-SCAN GUARD: Counts raw bracket depth before parsing to avoid Stack Overflow/Nesting Bombs.
+    pub fn pre_scan_depth(input: &str, max_depth: usize) -> bool {
+        let mut depth = 0;
+        let mut max_observed = 0;
+        for c in input.chars() {
+            match c {
+                '{' | '[' => {
+                    depth += 1;
+                    if depth > max_observed { max_observed = depth; }
+                    if depth > max_depth { return false; }
+                }
+                '}' | ']' => {
+                    if depth > 0 { depth -= 1; }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
 }

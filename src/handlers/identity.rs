@@ -138,8 +138,17 @@ impl IdentityHandler {
             for pk in pk_list { prekeys.push(serde_json::to_string(pk).unwrap_or_default()); }
         }
 
-        let _ = self.redis.store_user_bundle(id_hash, &serde_json::to_string(req).unwrap_or_default()).await;
-        if !prekeys.is_empty() { let _ = self.redis.store_otk_pool(id_hash, prekeys).await; }
+        if let Err(e) = self.redis.store_user_bundle(id_hash, &serde_json::to_string(req).unwrap_or_default()).await {
+            response["error"] = json!(format!("Bundle storage failed: {}", e));
+            return response;
+        }
+
+        if !prekeys.is_empty() { 
+            if let Err(e) = self.redis.store_otk_pool(id_hash, prekeys).await {
+                response["error"] = json!(format!("OTK pool storage failed: {}", e));
+                return response;
+            }
+        }
 
         let mut res = json!({ "type": "keys_upload_res", "status": "success" });
         if let Some(rid) = req.get("req_id") { res.as_object_mut().unwrap().insert("req_id".to_string(), rid.clone()); }

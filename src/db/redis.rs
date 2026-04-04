@@ -90,6 +90,13 @@ impl RedisManager {
             local jail_key = key .. ':jail'
             local violation_key = key .. ':viol'
             
+            -- 🛡️ UNIVERSAL JAIL CHECK: If media spammed, the relay jail key also bans you
+            if key:sub(1,11) == 'limit:media' then
+               local global_jail = 'limit:relay' .. key:sub(12) .. ':jail'
+               local global_ttl = redis.call('TTL', global_jail)
+               if global_ttl > 0 then return {-1, 0, global_ttl} end
+            end
+
             local jail_ttl = redis.call('TTL', jail_key)
             if jail_ttl > 0 then return {-1, 0, jail_ttl} end
             
@@ -108,7 +115,12 @@ impl RedisManager {
                 if viol == 1 then redis.call('EXPIRE', violation_key, period * 2) end
                 
                 if viol > violation_threshold then
+                    -- 🔐 BAN THE IDENTITY: Set both the specific and global jail keys
                     redis.call('SETEX', jail_key, jail_duration, 'banned')
+                    if key:sub(1,11) == 'limit:media' then
+                        local global_jail = 'limit:relay' .. key:sub(12) .. ':jail'
+                        redis.call('SETEX', global_jail, jail_duration, 'banned')
+                    end
                     return {-1, 0, jail_duration}
                 end
                 
@@ -128,6 +140,11 @@ impl RedisManager {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs_f64();
         let jail_duration = self.config.jail_duration_sec;
+         
+        if self.config.jail_duration_sec > 0 {
+             // Debug print only if log is visible
+             // println!("[Redis] Checking Rate Limit: {} (threshold={})", key, self.config.violation_jail_threshold);
+        }
 
         let result: Vec<i64> = script
             .key(key)
@@ -213,12 +230,47 @@ impl RedisManager {
         Ok(())
     }
 
-    pub async fn store_offline_message(&self, recipient_hash: &str, message: &[u8], limit: usize) -> Result<bool> {
+    pub async fn store_offline_message(&self, recipient_hash: &str, sender_hash: &str, message: &[u8], limit: usize, sender_limit: usize) -> Result<bool> {
         let mut conn = self.connection.clone();
         let key = format!("msg:{}", recipient_hash);
-        let _: () = conn.lpush(&key, message).await?;
-        let _: () = conn.ltrim(&key, -(limit as isize), -1).await?;
-        let _: () = conn.expire(&key, 86400).await?;
+        let sender_count_key = format!("offcnt:{}:{}", recipient_hash, sender_hash);
+        let sender_set_key = format!("offsenders:{}", recipient_hash);
+        
+        let script = redis::Script::new(r"
+            local msg_key = KEYS[1]
+            local sc_key = KEYS[2]
+            local ss_key = KEYS[3]
+            local msg_data = ARGV[1]
+            local limit = tonumber(ARGV[2])
+            local sender_limit = tonumber(ARGV[3])
+            
+            -- 🛡️ ATOMIC PROTECTION: One check to rule them all
+            local global_count = redis.call('LLEN', msg_key)
+            if global_count >= limit then
+                return {err = 'ERR_MAILBOX_FULL'}
+            end
+            
+            local current_sender_count = tonumber(redis.call('GET', sc_key) or 0)
+            if current_sender_count >= sender_limit then
+                return {err = 'ERR_SENDER_QUOTA'}
+            end
+            
+            -- Success Path
+            redis.call('RPUSH', msg_key, msg_data)
+            redis.call('EXPIRE', msg_key, 86400)
+            
+            redis.call('INCR', sc_key)
+            redis.call('EXPIRE', sc_key, 86400)
+            redis.call('SADD', ss_key, sc_key)
+            redis.call('EXPIRE', ss_key, 86400)
+            
+            return 1
+        ");
+
+        let _: () = script.key(key).key(sender_count_key).key(sender_set_key)
+            .arg(message).arg(limit).arg(sender_limit)
+            .invoke_async(&mut conn).await?;
+            
         Ok(true)
     }
 
@@ -232,14 +284,21 @@ impl RedisManager {
     pub async fn get_offline_messages(&self, recipient_hash: &str) -> Result<Vec<Vec<u8>>> {
         let mut conn = self.connection.clone();
         let key = format!("msg:{}", recipient_hash);
+        let sender_set_key = format!("offsenders:{}", recipient_hash);
+        
         let script = redis::Script::new(r"
             local msgs = redis.call('LRANGE', KEYS[1], 0, -1)
             if #msgs > 0 then
                 redis.call('DEL', KEYS[1])
+                local senders = redis.call('SMEMBERS', KEYS[2])
+                for _, sc_key in ipairs(senders) do
+                    redis.call('DEL', sc_key)
+                end
+                redis.call('DEL', KEYS[2])
             end
             return msgs
         ");
-        let messages: Vec<Vec<u8>> = script.key(key).invoke_async(&mut conn).await?;
+        let messages: Vec<Vec<u8>> = script.key(key).key(sender_set_key).invoke_async(&mut conn).await?;
         Ok(messages)
     }
 
@@ -265,16 +324,39 @@ impl RedisManager {
     }
 
     pub async fn store_otk_pool(&self, user_hash: &str, keys: Vec<String>) -> Result<()> {
+        if keys.is_empty() { return Ok(()); }
+        
         let mut conn = self.connection.clone();
         let key = format!("otk:{}", user_hash);
-        let current_count: u64 = conn.scard(&key).await?;
-        if current_count + (keys.len() as u64) > 100 {
-            return Err(anyhow::anyhow!("OTK pool limit exceeded (max 100)"));
-        }
-        let mut pipe = redis::pipe();
-        for k in keys { pipe.sadd(&key, k); }
-        pipe.expire(&key, 2592000);
-        let _: () = pipe.query_async(&mut conn).await?;
+        
+        let script = redis::Script::new(r#"
+            local key = KEYS[1]
+            local limit = tonumber(ARGV[1])
+            local current_count = redis.call('SCARD', key)
+            
+            local slots_available = limit - current_count
+            if slots_available <= 0 then
+                return 0
+            end
+            
+            local added = 0
+            for i = 2, #ARGV do
+                if added >= slots_available then
+                    break
+                end
+                redis.call('SADD', key, ARGV[i])
+                added = added + 1
+            end
+            
+            redis.call('EXPIRE', key, 2592000)
+            return added
+        "#);
+
+        let mut inv = script.key(&key);
+        inv.arg(100); // The limit
+        for k in keys { inv.arg(k); }
+        
+        let _: u64 = inv.invoke_async(&mut conn).await?;
         Ok(())
     }
 

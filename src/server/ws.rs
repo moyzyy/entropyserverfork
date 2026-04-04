@@ -121,6 +121,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             break 'outer;
                         }
 
+                        if !InputValidator::pre_scan_depth(&text, state.config.max_json_depth) {
+                            tracing::warn!("[Security] JSON Depth violation (Pre-Scan/Text) - Dropping Frame");
+                            continue;
+                        }
                         let Ok(val) = serde_json::from_str::<Value>(&text) else { continue; };
                         if !process_command(val, &state, &mut guard, &tx, &mut _challenge_solved, &text).await {
                             break 'outer;
@@ -137,9 +141,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
                         let target_bytes = &data[0..64];
                         let b_type = data[64];
+
+                        // 🛡️ AUTHENTICATED JAIL CHECK (Binary Lane)
+                        if let Some(ref uid) = guard.identity_hash {
+                            if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), state.config.relay_window_sec, 0).await {
+                                if res.is_jailed {
+                                    tracing::warn!("[Security] Dropping Binary from Jailed Identity: {}", uid);
+                                    break 'outer;
+                                }
+                            }
+                        }
                         
                         // FAST-DROP 0x03 (Dummy Pacing)
                         if b_type == 0x03 {
+                            // Charge a cost of 1 token even for dummies to prevent pacing-floods
+                            if let Some(ref uid) = guard.identity_hash {
+                                let _ = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), state.config.relay_window_sec, 1).await;
+                            }
                             continue;
                         }
 
@@ -170,7 +188,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 for i in 0..entry.total { if let Some(c) = entry.chunks.remove(&i) { full_data.extend(c); } }
                                 control_assembler.remove(&transfer_id);
                                 if let Ok(cmd_text) = String::from_utf8(full_data) {
-                                    tracing::info!("[Net] Server reassembled Control: raw_size={}", cmd_text.len());
+                                    if !InputValidator::pre_scan_depth(&cmd_text, state.config.max_json_depth) {
+                                        tracing::warn!("[Security] JSON Depth violation (Pre-Scan/Control) - Dropping Reassembly");
+                                        continue;
+                                    }
                                     if let Ok(val) = serde_json::from_str::<Value>(&cmd_text) {
                                         if !process_command(val, &state, &mut guard, &tx, &mut _challenge_solved, &cmd_text).await {
                                             break 'outer;
@@ -184,8 +205,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     for &byte in target_bytes { if byte == 0 { break; } target.push(byte as char); }
                                     let target_hash = target.trim();
                                     if InputValidator::is_valid_hash(target_hash) {
-                                        // 1. SENDER CHECK (Primary Jailing)
-                                        if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid_hash), state.config.relay_limit.into(), 60, 1).await {
+                                        // 🛡️ SENDER CHECK: Enforce identity limits (Media or Relay)
+                                        let (sender_limit_key, sender_limit_size) = if b_type == 0x02 {
+                                            (format!("limit:media:uid:{}", uid_hash), state.config.media_limit.into())
+                                        } else {
+                                            (format!("limit:relay:uid:{}", uid_hash), state.config.relay_limit.into())
+                                        };
+
+                                        if let Ok(res) = state.redis.check_rate_limit(&sender_limit_key, sender_limit_size, state.config.relay_window_sec, 1).await {
                                             if !res.allowed {
                                                 if res.is_jailed { 
                                                     let _ = tx.send(QueuedMessage { msg: Message::Text(json!({"type": "error", "error": "Identity Jailed"}).to_string()) });
@@ -196,11 +223,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                             }
                                         }
 
-                                        // 2. RECIPIENT PROTECTION (Slower, no jailing for victim)
-                                        if let Ok(res) = state.redis.check_rate_limit(&format!("limit:recv:{}", target_hash), (state.config.relay_limit * 2).into(), 60, 1).await {
-                                            if res.allowed { 
-                                                state.relay.relay_binary(target_hash, &data[64..], uid_hash).await; 
-                                            }
+                                        // RECIPIENT PROTECTION REMOVED: Forwarding directly to target for unthrottled p2p transit
+                                        if b_type == 0x04 {
+                                            state.relay.relay_volatile(target_hash, &data[64..], uid_hash).await; 
+                                        } else {
+                                            state.relay.relay_binary(target_hash, &data[64..], uid_hash).await; 
                                         }
                                     }
                             } else { tracing::warn!("[Security] Rejected binary relay from unauthenticated socket."); }
@@ -244,7 +271,7 @@ async fn process_command(
         let _ = tx.send(QueuedMessage { msg: Message::Text(final_json.into()), });
     };
 
-    if !guard.authenticated && !["ping", "pow_challenge", "auth", "dummy_pacing"].contains(&msg_type) {
+    if !guard.authenticated && !["pow_challenge", "auth", "dummy_pacing"].contains(&msg_type) {
         tracing::warn!("[Security] Unauthorized command: {}", msg_type);
         send_response(json!({"type": "error", "error": "Handshake required"}), tx);
         return true; 
@@ -252,7 +279,8 @@ async fn process_command(
 
     // 🛡️ GLOBAL JAILING CHECK (Any authenticated activity)
     if let Some(ref uid) = guard.identity_hash {
-        if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), 60, 0).await {
+        // Fix: Changed cost from 0 to 1 to prevent high-frequency Command-Flood DoS
+        if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), state.config.relay_window_sec, 1).await {
             if res.is_jailed {
                 send_response(json!({"type": "error", "error": "Identity Jailed"}), tx);
                 return false; // Terminal disconnect
@@ -261,7 +289,6 @@ async fn process_command(
     }
 
     match msg_type {
-        "ping" => { send_response(json!({ "type": "pong", "timestamp": val.get("timestamp").cloned().unwrap_or(json!(0)) }), tx); }
         "pow_challenge" => { send_response(state.identity.handle_pow_challenge(&val).await, tx); }
         "auth" => {
             let mut auth_valid = false;
@@ -292,7 +319,7 @@ async fn process_command(
             }
             if auth_valid && !id_hash_str.is_empty() {
                 // 🛡️ JAILING PRE-CHECK
-                if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", id_hash_str), state.config.relay_limit.into(), 60, 0).await {
+                if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", id_hash_str), state.config.relay_limit.into(), state.config.relay_window_sec, 0).await {
                     if res.is_jailed {
                         send_response(json!({"type": "error", "error": "Identity Jailed"}), tx);
                         return false;
@@ -337,7 +364,7 @@ async fn process_command(
             } else {
                 return false; 
             };
-            if let Ok(res) = state.redis.check_rate_limit(&limit_key, state.config.keys_upload_limit.into(), 3600, 1).await {
+            if let Ok(res) = state.redis.check_rate_limit(&limit_key, state.config.keys_upload_limit.into(), state.config.keys_window_sec, 1).await {
                 if !res.allowed { return false; }
             }
             send_response(state.identity.handle_keys_upload(&val).await, tx);
@@ -367,7 +394,7 @@ async fn process_command(
             if let Some(ref uid) = guard.identity_hash {
                 let is_relay = val.get("target").is_some() || val.get("type").map(|t| t == "text_msg").unwrap_or(false);
                 if is_relay {
-                    if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), 60, 1).await {
+                    if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), state.config.relay_window_sec, 1).await {
                         if res.allowed { state.relay.relay_message(raw_text, uid).await; }
                         else {
                             if res.is_jailed {

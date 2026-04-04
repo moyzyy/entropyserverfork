@@ -24,6 +24,8 @@ pub struct ServerConfig {
     // Rate Limiting
     pub rate_limit_per_sec: f64,
     pub rate_limit_burst: usize,
+    pub relay_window_sec: i64,
+    pub keys_window_sec: i64,
     
     // PoW
     pub pow_base_difficulty: i32,
@@ -36,6 +38,7 @@ pub struct ServerConfig {
     pub nick_register_limit: i32,
     pub nick_lookup_limit: i32,
     pub account_burn_limit: i32,
+    pub media_limit: i32,
 
     pub admin_token: String,
     
@@ -50,6 +53,7 @@ pub struct ServerConfig {
     pub max_pow_difficulty: i32,
     pub max_json_depth: usize,
     pub max_offline_messages: usize,
+    pub max_offline_messages_per_sender: usize,
     
     // Traffic Pacing
     pub pacing: PacingConfig,
@@ -93,6 +97,8 @@ impl ServerConfig {
             violation_reset_sec: env::var("ENTROPY_VIOL_RESET").unwrap_or_else(|_| "3600".to_string()).parse().expect("Invalid Viol Reset TTL"),
             rate_limit_per_sec: env::var("ENTROPY_RATE_LIMIT").expect("ENTROPY_RATE_LIMIT missing").parse().expect("Invalid rate"),
             rate_limit_burst: env::var("ENTROPY_RATE_BURST").expect("ENTROPY_RATE_BURST missing").parse().expect("Invalid burst"),
+            relay_window_sec: env::var("ENTROPY_RELAY_WINDOW").unwrap_or_else(|_| "60".to_string()).parse().expect("Invalid window"),
+            keys_window_sec: env::var("ENTROPY_KEYS_WINDOW").unwrap_or_else(|_| "3600".to_string()).parse().expect("Invalid window"),
             pow_base_difficulty: env::var("ENTROPY_POW_BASE").expect("ENTROPY_POW_BASE missing").parse().expect("Invalid difficulty"),
             global_rate_limit: env::var("ENTROPY_LIMIT_GLOBAL").expect("ENTROPY_LIMIT_GLOBAL missing").parse().expect("Invalid limit"),
             keys_upload_limit: env::var("ENTROPY_LIMIT_KEYS_UPLOAD").expect("ENTROPY_LIMIT_KEYS_UPLOAD missing").parse().expect("Invalid limit"),
@@ -101,6 +107,7 @@ impl ServerConfig {
             nick_register_limit: env::var("ENTROPY_LIMIT_NICK_REGISTER").expect("ENTROPY_LIMIT_NICK_REGISTER missing").parse().expect("Invalid limit"),
             nick_lookup_limit: env::var("ENTROPY_LIMIT_NICK_LOOKUP").expect("ENTROPY_LIMIT_NICK_LOOKUP missing").parse().expect("Invalid limit"),
             account_burn_limit: env::var("ENTROPY_LIMIT_ACCOUNT_BURN").expect("ENTROPY_LIMIT_ACCOUNT_BURN missing").parse().expect("Invalid limit"),
+            media_limit: env::var("ENTROPY_LIMIT_MEDIA").unwrap_or_else(|_| "10000".to_string()).parse().expect("Invalid limit"),
             admin_token: env::var("ENTROPY_ADMIN_TOKEN").expect("ENTROPY_ADMIN_TOKEN missing"),
             allowed_origins: env::var("ENTROPY_ALLOWED_ORIGINS").expect("ENTROPY_ALLOWED_ORIGINS missing").split(',').map(|s| s.to_string()).collect(),
             allowed_methods: vec!["GET".to_string(), "POST".to_string(), "OPTIONS".to_string()],
@@ -110,6 +117,7 @@ impl ServerConfig {
             max_pow_difficulty: env::var("ENTROPY_POW_DIFF").expect("ENTROPY_POW_DIFF missing").parse().expect("Invalid diff"),
             max_json_depth: env::var("ENTROPY_MAX_JSON_DEPTH").expect("ENTROPY_MAX_JSON_DEPTH missing").parse().expect("Invalid depth"),
             max_offline_messages: env::var("ENTROPY_MAX_OFFLINE_MSGS").expect("ENTROPY_MAX_OFFLINE_MSGS missing").parse().expect("Invalid count"),
+            max_offline_messages_per_sender: env::var("ENTROPY_MAX_OFFLINE_PER_SENDER").unwrap_or_else(|_| "5".to_string()).parse().expect("Invalid count"),
             pacing: PacingConfig {
                 packet_size: env::var("ENTROPY_PACING_SIZE").expect("ENTROPY_PACING_SIZE missing").parse().expect("Invalid size"),
                 tick_interval_ms: env::var("ENTROPY_PACING_TICK").expect("ENTROPY_PACING_TICK missing").parse().expect("Invalid tick"),
