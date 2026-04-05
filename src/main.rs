@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     
     let metrics = Metrics::new();
     let registry = Arc::new(Registry::new());
-    let redis = RedisManager::new(config.clone(), registry.clone()).await?;
+    let redis = RedisManager::new(config.clone()).await?;
     let relay = Arc::new(MessageRelay::new(registry.clone(), redis.clone(), config.clone(), metrics.clone()));
     let identity_handler = Arc::new(IdentityHandler::new(redis.clone(), registry.clone(), config.clone()));
     let health_handler = Arc::new(HealthHandler::new(config.clone(), registry.clone(), metrics.clone()));

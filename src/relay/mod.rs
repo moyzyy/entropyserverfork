@@ -125,7 +125,6 @@ impl MessageRelay {
             
             match self.redis.store_offline_message(target_hash, sender_hash, &payload, self.config.max_offline_messages, self.config.max_offline_messages_per_sender).await {
                 Ok(_) => {
-                    let _ = self.redis.publish_message(target_hash, &payload).await;
                     if let Some(sender_tx) = self.registry.get_connection(sender_hash) {
                         let response = json!({ "type": "delivery_status", "target": target_hash, "status": "relayed", "transfer_id": transfer_id });
                         let mut response_str = serde_json::to_string(&response).unwrap();

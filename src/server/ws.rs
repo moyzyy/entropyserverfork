@@ -43,10 +43,6 @@ impl Drop for ConnectionGuard {
         }
         if let Some(id_hash) = self.identity_hash.take() {
             self.state.registry.remove_connection(&id_hash);
-            let redis = self.state.redis.clone();
-            tokio::spawn(async move {
-                let _ = redis.unsubscribe_user(&id_hash).await;
-            });
         }
     }
 }
@@ -336,7 +332,6 @@ async fn process_command(
                     let _ = old_tx.send(QueuedMessage { msg: Message::Close(None) });
                 }
 
-                let _ = state.redis.subscribe_user(&id_hash_str).await;
                 let new_token = state.redis.create_session_token(&id_hash_str, state.config.session_ttl_sec).await.unwrap_or_default();
                 
                 let otk_count = state.redis.get_otk_count(&id_hash_str).await.unwrap_or(0);

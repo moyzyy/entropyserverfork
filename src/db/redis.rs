@@ -1,10 +1,7 @@
 use redis::AsyncCommands;
-use futures_util::StreamExt;
 use std::sync::Arc;
 use crate::config::ServerConfig;
-use crate::server::registry::Registry;
 use anyhow::Result;
-use tracing::error;
 use std::time::{SystemTime, UNIX_EPOCH};
 use rand::{thread_rng, RngCore};
 use hex;
@@ -19,59 +16,23 @@ pub struct RateLimitResult {
 }
 
 pub struct RedisManager {
-    client: redis::Client,
     connection: redis::aio::MultiplexedConnection,
-    registry: Arc<Registry>,
     config: Arc<ServerConfig>,
 }
 
 impl RedisManager {
-    pub async fn new(config: Arc<ServerConfig>, registry: Arc<Registry>) -> Result<Arc<Self>> {
+    pub async fn new(config: Arc<ServerConfig>) -> Result<Arc<Self>> {
         let client = redis::Client::open(config.redis_url.clone())?;
         let connection = client.get_multiplexed_async_connection().await?;
         
         let manager = Arc::new(Self {
-            client,
             connection,
-            registry,
             config: config.clone(),
-        });
-
-        let manager_clone = manager.clone();
-        tokio::spawn(async move {
-            if let Err(e) = manager_clone.run_subscriber_loop().await {
-                error!("Redis subscriber loop error: {}", e);
-            }
         });
 
         Ok(manager)
     }
 
-    async fn run_subscriber_loop(&self) -> Result<()> {
-        let client = self.client.clone();
-        let registry_clone = self.registry.clone();
-        
-        loop {
-            let mut pubsub = client.get_async_pubsub().await?;
-            pubsub.psubscribe("relay:*").await?;
-            
-            let mut stream = pubsub.on_message();
-            
-            while let Some(msg) = stream.next().await {
-                let channel: String = msg.get_channel_name().to_string();
-                
-                if channel.starts_with("relay:") {
-                    let id_hash = &channel[6..];
-                    let payload: Vec<u8> = msg.get_payload().unwrap_or_default();
-                    if let Some(sender) = registry_clone.get_connection(id_hash) {
-                        let _ = sender.send(crate::relay::QueuedMessage {
-                            msg: axum::extract::ws::Message::Binary(payload.into()),
-                        });
-                    }
-                }
-            }
-        }
-    }
 
     pub async fn check_rate_limit(&self, key: &str, limit: i64, window_sec: i64, cost: i64) -> Result<RateLimitResult> {
         let mut conn = self.connection.clone();
@@ -214,21 +175,6 @@ impl RedisManager {
         Ok(())
     }
 
-    pub async fn publish_message(&self, recipient_hash: &str, message: &[u8]) -> Result<()> {
-        let mut conn = self.connection.clone();
-        let channel = format!("relay:{}", recipient_hash);
-        let _: () = conn.publish(channel, message).await?;
-        Ok(())
-    }
-
-    pub async fn publish_multicast(&self, recipient_hashes: &Vec<String>, message: &str) -> Result<()> {
-        let mut conn = self.connection.clone();
-        for hash in recipient_hashes {
-            let channel = format!("relay:{}", hash);
-            let _: () = conn.publish(channel, message).await?;
-        }
-        Ok(())
-    }
 
     pub async fn store_offline_message(&self, recipient_hash: &str, sender_hash: &str, message: &[u8], limit: usize, sender_limit: usize) -> Result<bool> {
         let mut conn = self.connection.clone();
@@ -302,8 +248,6 @@ impl RedisManager {
         Ok(messages)
     }
 
-    pub async fn subscribe_user(&self, _user_hash: &str) -> Result<()> { Ok(()) }
-    pub async fn unsubscribe_user(&self, _user_hash: &str) -> Result<()> { Ok(()) }
 
     pub async fn store_user_bundle(&self, user_hash: &str, bundle_json: &str) -> Result<()> {
         let mut conn = self.connection.clone();
@@ -463,6 +407,14 @@ impl RedisManager {
             redis.call('DEL', 'sess:' .. id)
             redis.call('DEL', 'seen:' .. id)
             redis.call('DEL', 'otk:' .. id)
+            redis.call('DEL', 'limit:relay:uid:' .. id)
+            redis.call('DEL', 'limit:relay:uid:' .. id .. ':jail')
+            redis.call('DEL', 'limit:relay:uid:' .. id .. ':viol')
+            redis.call('DEL', 'limit:media:uid:' .. id)
+            redis.call('DEL', 'limit:media:uid:' .. id .. ':jail')
+            redis.call('DEL', 'limit:media:uid:' .. id .. ':viol')
+            redis.call('DEL', 'limit:keys_up:uid:' .. id)
+            redis.call('DEL', 'limit:nick:reg:' .. id)
             redis.call('SREM', 'active_users', id)
             return 1
         ";

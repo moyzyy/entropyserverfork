@@ -243,7 +243,11 @@ impl IdentityHandler {
         let pk_bytes = if pk_val.len() == 64 { hex::decode(pk_val).unwrap_or_default() } else { BASE64.decode(pk_val).unwrap_or_default() };
         let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };
 
-        if !InputValidator::verify_xeddsa(&pk_bytes, id_hash.as_bytes(), &sig_bytes) { return json!({}); }
+        let payload = format!("BURN_ACCOUNT:{}", id_hash);
+        if !InputValidator::verify_xeddsa(&pk_bytes, payload.as_bytes(), &sig_bytes) { 
+            tracing::error!("[Auth] Burn signature verification failed for {}", id_hash);
+            return json!({}); 
+        }
         match self.redis.nuclear_burn(id_hash).await {
             Ok(_) => json!({ "type": "account_burn_res", "status": "success" }),
             _ => json!({ "type": "error" }),
