@@ -135,9 +135,9 @@ impl MessageRelay {
                 Err(e) => {
                     let err_str = e.to_string();
                     let (reason, msg): (&str, &str) = if err_str.contains("ERR_MAILBOX_FULL") {
-                        ("storage_full", "Recipient's mailbox is full (200/200).")
+                        ("storage_full", "Recipient's mailbox is full (500/500).")
                     } else if err_str.contains("ERR_SENDER_QUOTA") {
-                        ("sender_quota_exceeded", "You have reached your 5-message limit for this recipient.")
+                        ("sender_quota_exceeded", "You have reached your 15-message limit for this recipient.")
                     } else {
                         ("delivery_error", err_str.as_str())
                     };

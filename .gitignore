@@ -1,4 +1,19 @@
-/target
-*.txt
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Logs
+logs/
 *.log
+
+# Env files
 .env
+.env.*
+
+# Local IDE folders
+.vscode/
+.idea/
+
+# Minisign keys (NEVER PUSH PRIVATE KEYS)
+*.key
+!*.key.pub
