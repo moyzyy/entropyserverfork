@@ -19,6 +19,12 @@ pub struct FragmentBuffer {
     pub last_activity: tokio::time::Instant,
 }
 
+enum CommandResult {
+    Continue,
+    Close,
+    ErrorAndClose(Value),
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -76,9 +82,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     'outer: loop {
         tokio::select! {
             Some(qm) = rx.recv() => {
-                let frame_type = match &qm.msg { Message::Text(_) => "Text", Message::Binary(_) => "Binary", Message::Close(_) => "Close", _ => "Other" };
-                let wire_size = match &qm.msg { Message::Text(t) => t.len(), Message::Binary(b) => b.len(), _ => 0 };
-                tracing::info!("[Net] Server sending {} Frame: wire_size={}", frame_type, wire_size);
+
                 if sender.send(qm.msg).await.is_err() { break 'outer; }
             }
             _ = &mut cleanup_timer => {
@@ -97,7 +101,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 dummy_vec[0] = 0x03; // Type 0x03 Binary Dummy
                 TrafficNormalizer::pad_binary(&mut dummy_vec, state.config.pacing.packet_size);
                 
-                tracing::info!("[Net] Server sending Binary Dummy Pacing: wire_size={}", dummy_vec.len());
+
                 if sender.send(Message::Binary(dummy_vec.into())).await.is_err() { break 'outer; }
                 
                 if last_activity.elapsed() > conn_timeout { break 'outer; }
@@ -122,8 +126,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             continue;
                         }
                         let Ok(val) = serde_json::from_str::<Value>(&text) else { continue; };
-                        if !process_command(val, &state, &mut guard, &tx, &mut _challenge_solved, &text).await {
-                            break 'outer;
+                        match process_command(val, &state, &mut guard, &tx, &mut _challenge_solved, &text).await {
+                            CommandResult::Continue => {},
+                            CommandResult::Close => break 'outer,
+                            CommandResult::ErrorAndClose(err_val) => {
+                                let mut final_json = serde_json::to_string(&err_val).unwrap();
+                                TrafficNormalizer::pad_json_str(&mut final_json, state.config.pacing.packet_size);
+                                let _ = sender.send(Message::Text(final_json.into())).await;
+                                break 'outer;
+                            }
                         }
                     }
                     Message::Binary(data) => {
@@ -189,8 +200,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         continue;
                                     }
                                     if let Ok(val) = serde_json::from_str::<Value>(&cmd_text) {
-                                        if !process_command(val, &state, &mut guard, &tx, &mut _challenge_solved, &cmd_text).await {
-                                            break 'outer;
+                                        match process_command(val, &state, &mut guard, &tx, &mut _challenge_solved, &cmd_text).await {
+                                            CommandResult::Continue => {},
+                                            CommandResult::Close => break 'outer,
+                                            CommandResult::ErrorAndClose(err_val) => {
+                                                let mut final_json = serde_json::to_string(&err_val).unwrap();
+                                                TrafficNormalizer::pad_json_str(&mut final_json, state.config.pacing.packet_size);
+                                                let _ = sender.send(Message::Text(final_json.into())).await;
+                                                break 'outer;
+                                            }
                                         }
                                     }
                                 }
@@ -244,11 +262,11 @@ async fn process_command(
     tx: &tokio::sync::mpsc::UnboundedSender<QueuedMessage>,
     _challenge_solved: &mut bool,
     raw_text: &str,
-) -> bool {
+) -> CommandResult {
     let depth = InputValidator::get_json_depth(&val);
     if depth > state.config.max_json_depth { 
         tracing::warn!("[Security] JSON Depth violation from authenticated identity - REJECTING"); 
-        return false; 
+        return CommandResult::Close; 
     }
 
     let msg_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
@@ -258,19 +276,15 @@ async fn process_command(
             res["req_id"] = id.clone();
         }
         let mut final_json = serde_json::to_string(&res).unwrap();
-        let raw_len = final_json.len();
+
         TrafficNormalizer::pad_json_str(&mut final_json, state.config.pacing.packet_size);
-        tracing::info!("[Net] Prepared Response: raw_size={} bytes, wire_size={} bytes, overhead={} bytes", 
-            raw_len, 
-            final_json.len(), 
-            final_json.len().saturating_sub(raw_len));
+
         let _ = tx.send(QueuedMessage { msg: Message::Text(final_json.into()), });
     };
 
     if !guard.authenticated && !["pow_challenge", "auth", "dummy_pacing"].contains(&msg_type) {
         tracing::warn!("[Security] Unauthorized command: {}", msg_type);
-        send_response(json!({"type": "error", "error": "Handshake required"}), tx);
-        return true; 
+        return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Handshake required"}));
     }
 
     // 🛡️ GLOBAL JAILING CHECK (Any authenticated activity)
@@ -278,8 +292,7 @@ async fn process_command(
         // Fix: Changed cost from 0 to 1 to prevent high-frequency Command-Flood DoS
         if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), state.config.relay_window_sec, 1).await {
             if res.is_jailed {
-                send_response(json!({"type": "error", "error": "Identity Jailed"}), tx);
-                return false; // Terminal disconnect
+                return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Identity Jailed"}));
             }
         }
     }
@@ -317,8 +330,7 @@ async fn process_command(
                 // 🛡️ JAILING PRE-CHECK
                 if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", id_hash_str), state.config.relay_limit.into(), state.config.relay_window_sec, 0).await {
                     if res.is_jailed {
-                        send_response(json!({"type": "error", "error": "Identity Jailed"}), tx);
-                        return false;
+                        return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Identity Jailed"}));
                     }
                 }
 
@@ -328,10 +340,11 @@ async fn process_command(
                 guard.identity_hash = Some(id_hash_str.clone());
 
                 if let Some(old_tx) = state.registry.add_connection(id_hash_str.clone(), tx.clone()) {
-                    tracing::info!("[Net] Ghost Protocol: Terminating abandoned socket for {}", id_hash_str);
+
                     let _ = old_tx.send(QueuedMessage { msg: Message::Close(None) });
                 }
 
+                let _ = state.redis.refresh_nickname_ttl(&id_hash_str).await;
                 let new_token = state.redis.create_session_token(&id_hash_str, state.config.session_ttl_sec).await.unwrap_or_default();
                 
                 let otk_count = state.redis.get_otk_count(&id_hash_str).await.unwrap_or(0);
@@ -345,22 +358,23 @@ async fn process_command(
                     "otk_count": otk_count
                 });
                 
-                tracing::info!("[Auth] Login Success: id={} otk_remaining={}", id_hash_str, otk_count);
+
                 send_response(response, tx);
                 state.relay.deliver_pending(&id_hash_str, tx.clone()).await;
             } else {
-                send_response(json!({"type": "error", "error": "Handshake failed"}), tx);
-                return false;
+                let mut err_res = json!({"type": "error", "error": "Handshake failed", "code": "auth_failed"});
+                if let Some(rid) = req_id { err_res["req_id"] = rid; }
+                return CommandResult::ErrorAndClose(err_res);
             }
         }
         "keys_upload" => {
             let limit_key = if let Some(ref uid) = guard.identity_hash {
                 format!("limit:keys_up:uid:{}", uid)
             } else {
-                return false; 
+                return CommandResult::Close; 
             };
             if let Ok(res) = state.redis.check_rate_limit(&limit_key, state.config.keys_upload_limit.into(), state.config.keys_window_sec, 1).await {
-                if !res.allowed { return false; }
+                if !res.allowed { return CommandResult::Close; }
             }
             send_response(state.identity.handle_keys_upload(&val).await, tx);
         }
@@ -393,16 +407,15 @@ async fn process_command(
                         if res.allowed { state.relay.relay_message(raw_text, uid).await; }
                         else {
                             if res.is_jailed {
-                                send_response(json!({"type": "error", "error": "Identity Jailed"}), tx);
-                                return false; 
+                                return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Identity Jailed"}));
                             }
                             send_response(json!({"type": "error", "error": "Rate limit exceeded"}), tx);
-                            return true; // Simple rate limit
+                            return CommandResult::Continue; // Simple rate limit
                         }
                     }
                 }
             }
         }
     }
-    true
+    CommandResult::Continue
 }

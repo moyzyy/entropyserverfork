@@ -97,7 +97,5 @@ async fn security_headers_middleware(req: axum::http::Request<axum::body::Body>,
     headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
     headers.insert("X-Frame-Options", "DENY".parse().unwrap());
     headers.insert("Strict-Transport-Security", "max-age=31536000; includeSubDomains".parse().unwrap());
-    headers.insert("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'".parse().unwrap());
-    headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
     response
 }

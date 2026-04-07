@@ -36,13 +36,16 @@ impl InputValidator {
     }
 
     pub fn verify_xeddsa(x25519_pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
-        if x25519_pubkey.len() != 32 || signature.len() != 64 { return false; }
+        let mut key_32 = x25519_pubkey.to_vec();
+        if key_32.len() == 33 && key_32[0] == 0x05 {
+            key_32.remove(0);
+        }
+        
+        if key_32.len() != 32 || signature.len() != 64 { return false; }
         
         // Use libsignal directly for XEdDSA verification parity
-        let mut full_pk = x25519_pubkey.to_vec();
-        if full_pk.len() == 32 {
-            full_pk.insert(0, 0x05);
-        }
+        let mut full_pk = key_32.clone();
+        full_pk.insert(0, 0x05);
 
         let Ok(id_key) = IdentityKey::decode(&full_pk) else {
             tracing::info!("verify_xeddsa: failed to decode IdentityKey (len={})", full_pk.len());
@@ -55,12 +58,16 @@ impl InputValidator {
         }
 
         // Fallback to raw Ed25519 check for non-signal keys
-        Self::verify_ed25519(x25519_pubkey, message, signature)
+        Self::verify_ed25519(&key_32, message, signature)
     }
 
     pub fn verify_ed25519(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
-        if pubkey.len() != 32 { return false; }
-        let Ok(key) = VerifyingKey::from_bytes(pubkey.try_into().unwrap_or(&[0;32])) else { 
+        let mut key_32 = pubkey.to_vec();
+        if key_32.len() == 33 && key_32[0] == 0x05 {
+            key_32.remove(0);
+        }
+        if key_32.len() != 32 { return false; }
+        let Ok(key) = VerifyingKey::from_bytes(key_32.as_slice().try_into().unwrap_or(&[0;32])) else { 
             return false; 
         };
         let sig = Signature::from_bytes(signature.try_into().unwrap_or(&[0;64]));

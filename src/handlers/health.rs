@@ -24,8 +24,7 @@ impl HealthHandler {
         let mut res = Json(json!({
             "status": "healthy",
             "storage": "none",
-            "message": "Ephemeral relay only - no data stored",
-            "tls": self.config.enable_tls
+            "message": "Ephemeral relay only - no data stored"
         })).into_response();
         
         self.add_headers(res.headers_mut());
@@ -74,15 +73,5 @@ impl HealthHandler {
 
     fn add_headers(&self, headers: &mut HeaderMap) {
         headers.insert("Server", HeaderValue::from_static("Entropy/2.0"));
-        headers.insert("X-Content-Type-Options", HeaderValue::from_static("nosniff"));
-        headers.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
-        headers.insert("X-XSS-Protection", HeaderValue::from_static("1; mode=block"));
-        headers.insert("Strict-Transport-Security", HeaderValue::from_static("max-age=31536000; includeSubDomains"));
-        headers.insert("Content-Security-Policy", HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"));
-        
-        // CORS
-        headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
-        headers.insert("Access-Control-Allow-Methods", HeaderValue::from_static("GET, POST, OPTIONS"));
-        headers.insert("Access-Control-Allow-Headers", HeaderValue::from_static("Content-Type, Authorization, X-Admin-Token"));
     }
 }

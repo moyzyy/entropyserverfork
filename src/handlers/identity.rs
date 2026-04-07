@@ -46,19 +46,22 @@ impl IdentityHandler {
     }
 
     async fn get_required_pow(&self, req: &Value) -> u32 {
-        let mut intensity_penalty = 0;
+        let mut penalty = 0;
         let intensity = self.redis.get_registration_intensity().await.unwrap_or(0);
-        if intensity > self.config.registration_intensity_low as i32 { intensity_penalty = 2; }
-        if intensity > self.config.registration_intensity_high as i32 { intensity_penalty = 4; }
+        if intensity > self.config.registration_intensity_low as i32 { penalty = 2; }
+        if intensity > self.config.registration_intensity_high as i32 { penalty = 4; }
         
-        let active_conns = self.registry.connection_count();
-        let mut difficulty = PoWVerifier::get_required_difficulty(self.config.pow_base_difficulty, active_conns, intensity_penalty, self.config.max_pow_difficulty as u32);
-        
-        if let Some(nick) = req.get("nickname").and_then(|n| n.as_str()) {
-            difficulty = PoWVerifier::get_difficulty_for_nickname(nick.len());
+        // 🚩 SHADOW PENALTY: Check if identity has recent violations
+        if let Some(id_hash) = req.get("identity_hash").or_else(|| req.get("id_hash")).and_then(|h| h.as_str()) {
+            if let Ok(count) = self.redis.get_identity_violations(id_hash).await {
+                if u64::from(count) >= self.config.identity_violation_threshold {
+                    penalty += 4; // Apply the same shadow penalty as the auth handler
+                }
+            }
         }
 
-        difficulty
+        let active_conns = self.registry.connection_count();
+        PoWVerifier::get_required_difficulty(self.config.pow_base_difficulty, active_conns, penalty, self.config.max_pow_difficulty as u32)
     }
 
     pub async fn validate_pow(&self, obj: &Value, context: &str, target_difficulty: u32) -> bool {
@@ -138,6 +141,11 @@ impl IdentityHandler {
             for pk in pk_list { prekeys.push(serde_json::to_string(pk).unwrap_or_default()); }
         }
 
+        let mut kyber_prekeys = Vec::new();
+        if let Some(kpk_list) = req.get("kyberPreKeys").and_then(|a| a.as_array()) {
+            for kpk in kpk_list { kyber_prekeys.push(serde_json::to_string(kpk).unwrap_or_default()); }
+        }
+
         if let Err(e) = self.redis.store_user_bundle(id_hash, &serde_json::to_string(req).unwrap_or_default()).await {
             response["error"] = json!(format!("Bundle storage failed: {}", e));
             return response;
@@ -150,43 +158,62 @@ impl IdentityHandler {
             }
         }
 
-        let mut res = json!({ "type": "keys_upload_res", "status": "success" });
-        if let Some(rid) = req.get("req_id") { res.as_object_mut().unwrap().insert("req_id".to_string(), rid.clone()); }
-        res
+        if !kyber_prekeys.is_empty() {
+            if let Err(e) = self.redis.store_kyber_otk_pool(id_hash, kyber_prekeys).await {
+                response["error"] = json!(format!("Kyber OTK pool storage failed: {}", e));
+                return response;
+            }
+        }
+
+        json!({"type": "keys_upload_res", "status": "success"})
     }
 
     pub async fn handle_keys_fetch(&self, req: &Value) -> Value {
         let response = json!({"type": "error", "status": "error"});
         let Some(target) = req.get("target_hash").and_then(|t| t.as_str()) else { return response; };
+        let Some(initiator_hash) = req.get("initiator_hash").and_then(|h| h.as_str()) else { return response; };
         
         let mut res = json!({ "type": "fetch_key_res" });
         if let Some(rid) = req.get("req_id") { res.as_object_mut().unwrap().insert("req_id".to_string(), rid.clone()); }
 
-        match self.redis.get_user_bundle(target).await {
-            Ok(Some(bundle_str)) => {
-                let mut bundle_json = serde_json::from_str::<Value>(&bundle_str).unwrap_or(json!({}));
-                if let Ok(Some(otk_str)) = self.redis.pop_otk(target).await {
+        // 🛡️ ANTI-DRAIN: Limit key fetches per identity
+        if let Ok(limit_res) = self.redis.check_rate_limit(&format!("limit:keys_f:uid:{}", initiator_hash), self.config.key_fetch_limit.into(), self.config.keys_window_sec, 1).await {
+            if !limit_res.allowed { return json!({"type": "error", "error": "Key fetch rate limit exceeded"}); }
+        }
+
+        if let Ok(Some(bundle_str)) = self.redis.get_user_bundle(target).await {
+            let mut bundle_json: Value = serde_json::from_str(&bundle_str).unwrap_or(json!({}));
+            
+            // 🦾 ATOMIC PQ UPGRADE: Pop both standard and Kyber OTKs simultaneously
+            if let Ok((otk, kyber_otk)) = self.redis.pop_pqdh_otks(target).await {
+                if let Some(otk_str) = otk {
                     if let Ok(otk_json) = serde_json::from_str::<Value>(&otk_str) {
                         bundle_json.as_object_mut().unwrap().insert("preKey".to_string(), otk_json);
                     }
                 }
-                
-                // 🦾 SYNC ALERT: Notify owner if their PreKey pool is running low
-                if let Ok(count) = self.redis.get_otk_count(target).await {
-                    if count < 10 {
-                        if let Some(target_tx) = self.registry.get_connection(target) {
-                            let alert = json!({ "type": "keys_low", "count": count });
-                            let mut alert_str = serde_json::to_string(&alert).unwrap();
-                            crate::security::noise::TrafficNormalizer::pad_json_str(&mut alert_str, self.config.pacing.packet_size);
-                            let _ = target_tx.send(crate::relay::QueuedMessage { msg: axum::extract::ws::Message::Text(alert_str.into()) });
-                        }
+                if let Some(kyber_otk_str) = kyber_otk {
+                    if let Ok(kyber_otk_json) = serde_json::from_str::<Value>(&kyber_otk_str) {
+                             bundle_json.as_object_mut().unwrap().insert("kyberPreKey".to_string(), kyber_otk_json);
                     }
                 }
+            }
 
-                res.as_object_mut().unwrap().insert("found".to_string(), json!(true));
-                res.as_object_mut().unwrap().insert("bundle".to_string(), bundle_json);
-            },
-            _ => { res.as_object_mut().unwrap().insert("found".to_string(), json!(false)); }
+            // 🦾 SYNC ALERT: Notify owner if their PreKey pool is running low
+            if let Ok(count) = self.redis.get_otk_count(target).await {
+                if count < 10 {
+                    if let Some(target_tx) = self.registry.get_connection(target) {
+                        let alert = json!({ "type": "keys_low", "count": count });
+                        let mut alert_str = serde_json::to_string(&alert).unwrap();
+                        crate::security::noise::TrafficNormalizer::pad_json_str(&mut alert_str, self.config.pacing.packet_size);
+                        let _ = target_tx.send(crate::relay::QueuedMessage { msg: axum::extract::ws::Message::Text(alert_str.into()) });
+                    }
+                }
+            }
+
+            res.as_object_mut().unwrap().insert("found".to_string(), json!(true));
+            res.as_object_mut().unwrap().insert("bundle".to_string(), bundle_json);
+        } else {
+            res.as_object_mut().unwrap().insert("found".to_string(), json!(false));
         }
         res
     }
@@ -224,6 +251,31 @@ impl IdentityHandler {
 
     pub async fn handle_nickname_lookup(&self, req: &Value) -> Value {
         let Some(name) = req.get("name").and_then(|n| n.as_str()) else { return json!({}); };
+        let Some(initiator_hash) = req.get("initiator_hash").and_then(|h| h.as_str()) else {
+            return json!({"type": "error", "error": "Initiator hash required"});
+        };
+        let Some(sig_str) = req.get("signature").and_then(|s| s.as_str()) else {
+            return json!({"type": "error", "error": "Signature required"});
+        };
+        let Some(pk_str) = req.get("public_key").and_then(|k| k.as_str()) else {
+            return json!({"type": "error", "error": "Public key required"});
+        };
+
+        // 🛡️ ANTI-SCRAPING: Strictly rate limit lookup per identity
+        if let Ok(res) = self.redis.check_rate_limit(&format!("limit:lookup:uid:{}", initiator_hash), self.config.lookup_limit.into(), self.config.relay_window_sec, 1).await {
+            if !res.allowed { return json!({"type": "error", "error": "Lookup rate limit exceeded"}); }
+        }
+
+        // 🔐 PROOF OF IDENTITY: Verify the requester is who they say they are
+        let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };
+        let pk_bytes = if pk_str.len() == 64 { hex::decode(pk_str).unwrap_or_default() } else { BASE64.decode(pk_str).unwrap_or_default() };
+        
+        let payload = format!("LOOKUP_NICKNAME:{}", name);
+        if !InputValidator::verify_xeddsa(&pk_bytes, payload.as_bytes(), &sig_bytes) &&
+           !InputValidator::verify_ed25519(&pk_bytes, payload.as_bytes(), &sig_bytes) {
+               return json!({"type": "error", "error": "Initiator signature invalid"});
+        }
+
         let h = self.redis.resolve_nickname(name).await.unwrap_or_default();
         let mut res = json!({ "type": "nickname_lookup_res" });
         if let Some(target) = h { res.as_object_mut().unwrap().insert("identity_hash".to_string(), json!(target)); }
@@ -231,9 +283,34 @@ impl IdentityHandler {
     }
 
     pub async fn handle_identity_resolve(&self, req: &Value) -> Value {
-        let Some(id_hash) = req.get("identity_hash").and_then(|h| h.as_str()) else { return json!({}); };
-        let nick = self.redis.get_nickname(id_hash).await.unwrap_or_default();
-        json!({ "type": "identity_resolve_res", "identity_hash": id_hash, "nickname": nick })
+        let Some(target_hash) = req.get("identity_hash").and_then(|h| h.as_str()) else { return json!({}); };
+        let Some(initiator_hash) = req.get("initiator_hash").and_then(|h| h.as_str()) else {
+            return json!({"type": "error", "error": "Initiator hash required"});
+        };
+        let Some(sig_str) = req.get("signature").and_then(|s| s.as_str()) else {
+            return json!({"type": "error", "error": "Signature required"});
+        };
+        let Some(pk_str) = req.get("public_key").and_then(|k| k.as_str()) else {
+            return json!({"type": "error", "error": "Public key required"});
+        };
+
+        // 🛡️ ANTI-SCRAPING: Strictly rate limit resolution per identity
+        if let Ok(res) = self.redis.check_rate_limit(&format!("limit:resolve:uid:{}", initiator_hash), self.config.lookup_limit.into(), self.config.relay_window_sec, 1).await {
+            if !res.allowed { return json!({"type": "error", "error": "Resolution rate limit exceeded"}); }
+        }
+
+        // 🔐 PROOF OF IDENTITY: Verify the requester is who they say they are
+        let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };
+        let pk_bytes = if pk_str.len() == 64 { hex::decode(pk_str).unwrap_or_default() } else { BASE64.decode(pk_str).unwrap_or_default() };
+        
+        let payload = format!("RESOLVE_IDENTITY:{}", target_hash);
+        if !InputValidator::verify_xeddsa(&pk_bytes, payload.as_bytes(), &sig_bytes) &&
+           !InputValidator::verify_ed25519(&pk_bytes, payload.as_bytes(), &sig_bytes) {
+               return json!({"type": "error", "error": "Initiator signature invalid"});
+        }
+
+        let nick = self.redis.get_nickname(target_hash).await.unwrap_or_default();
+        json!({ "type": "identity_resolve_res", "identity_hash": target_hash, "nickname": nick })
     }
 
     pub async fn handle_account_burn(&self, req: &Value) -> Value {

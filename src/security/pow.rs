@@ -19,11 +19,7 @@ impl PoWVerifier {
         std::cmp::min(diff as u32, max_diff)
     }
 
-    pub fn get_difficulty_for_nickname(len: usize) -> u32 {
-        if len <= 3 { return 500000; }
-        if len <= 5 { return 100000; }
-        10000
-    }
+
 
     pub fn validate_vdf(seed_hex: &str, result_hex: &str, difficulty: u32, modulus_hex: &str, phi_hex: &str) -> bool {
         let Ok(n) = BigUint::from_str_radix(modulus_hex, 10) else { return false; };

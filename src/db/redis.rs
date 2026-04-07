@@ -51,9 +51,10 @@ impl RedisManager {
             local jail_key = key .. ':jail'
             local violation_key = key .. ':viol'
             
-            -- 🛡️ UNIVERSAL JAIL CHECK: If media spammed, the relay jail key also bans you
-            if key:sub(1,11) == 'limit:media' then
-               local global_jail = 'limit:relay' .. key:sub(12) .. ':jail'
+            -- 🛡️ UNIVERSAL JAIL CHECK: If ANY action spammed, the identity is banned
+            local uid_start = key:find(':uid:')
+            if uid_start then
+               local global_jail = 'limit:relay' .. key:sub(uid_start) .. ':jail'
                local global_ttl = redis.call('TTL', global_jail)
                if global_ttl > 0 then return {-1, 0, global_ttl} end
             end
@@ -78,8 +79,8 @@ impl RedisManager {
                 if viol > violation_threshold then
                     -- 🔐 BAN THE IDENTITY: Set both the specific and global jail keys
                     redis.call('SETEX', jail_key, jail_duration, 'banned')
-                    if key:sub(1,11) == 'limit:media' then
-                        local global_jail = 'limit:relay' .. key:sub(12) .. ':jail'
+                    if uid_start then
+                        local global_jail = 'limit:relay' .. key:sub(uid_start) .. ':jail'
                         redis.call('SETEX', global_jail, jail_duration, 'banned')
                     end
                     return {-1, 0, jail_duration}
@@ -143,10 +144,15 @@ impl RedisManager {
             } else {
                 let current = (limit as i64).saturating_sub(val1); 
                 
-                if key.starts_with("limit:relay:uid:") {
-                    let viol_key = format!("{}:viol", key);
-                    let _: () = redis::cmd("INCR").arg(&viol_key).query_async(&mut conn).await.unwrap_or_default();
-                    let _: () = redis::cmd("EXPIRE").arg(&viol_key).arg(self.config.violation_reset_sec).query_async(&mut conn).await.unwrap_or_default();
+                if key.contains(":uid:") {
+                    let parts: Vec<&str> = key.split(':').collect();
+                    if let Some(pos) = parts.iter().position(|&p| p == "uid") {
+                        if let Some(uid) = parts.get(pos + 1) {
+                             let viol_key = format!("limit:relay:uid:{}:viol", uid);
+                             let _: () = redis::cmd("INCR").arg(&viol_key).query_async(&mut conn).await.unwrap_or_default();
+                             let _: () = redis::cmd("EXPIRE").arg(&viol_key).arg(self.config.violation_reset_sec).query_async(&mut conn).await.unwrap_or_default();
+                        }
+                    }
                 }
 
                 Ok(RateLimitResult {
@@ -189,6 +195,7 @@ impl RedisManager {
             local msg_data = ARGV[1]
             local limit = tonumber(ARGV[2])
             local sender_limit = tonumber(ARGV[3])
+            local ttl = tonumber(ARGV[4])
             
             -- 🛡️ ATOMIC PROTECTION: One check to rule them all
             local global_count = redis.call('LLEN', msg_key)
@@ -203,18 +210,18 @@ impl RedisManager {
             
             -- Success Path
             redis.call('RPUSH', msg_key, msg_data)
-            redis.call('EXPIRE', msg_key, 86400)
+            redis.call('EXPIRE', msg_key, ttl)
             
             redis.call('INCR', sc_key)
-            redis.call('EXPIRE', sc_key, 86400)
+            redis.call('EXPIRE', sc_key, ttl)
             redis.call('SADD', ss_key, sc_key)
-            redis.call('EXPIRE', ss_key, 86400)
+            redis.call('EXPIRE', ss_key, ttl)
             
             return 1
         ");
 
         let _: () = script.key(key).key(sender_count_key).key(sender_set_key)
-            .arg(message).arg(limit).arg(sender_limit)
+            .arg(message).arg(limit).arg(sender_limit).arg(self.config.offline_ttl_sec)
             .invoke_async(&mut conn).await?;
             
         Ok(true)
@@ -297,11 +304,61 @@ impl RedisManager {
         "#);
 
         let mut inv = script.key(&key);
-        inv.arg(100); // The limit
+        inv.arg(self.config.max_prekeys_per_upload); // The limit
         for k in keys { inv.arg(k); }
         
         let _: u64 = inv.invoke_async(&mut conn).await?;
         Ok(())
+    }
+
+    pub async fn store_kyber_otk_pool(&self, user_hash: &str, keys: Vec<String>) -> Result<()> {
+        if keys.is_empty() { return Ok(()); }
+        let mut conn = self.connection.clone();
+        let key = format!("kyber_otk:{}", user_hash);
+        let script = redis::Script::new(r#"
+            local key = KEYS[1]
+            local limit = tonumber(ARGV[1])
+            local current_count = redis.call('SCARD', key)
+            local slots_available = limit - current_count
+            if slots_available <= 0 then return 0 end
+            local added = 0
+            for i = 2, #ARGV do
+                if added >= slots_available then break end
+                redis.call('SADD', key, ARGV[i])
+                added = added + 1
+            end
+            redis.call('EXPIRE', key, 2592000)
+            return added
+        "#);
+        let mut inv = script.key(&key);
+        inv.arg(self.config.max_prekeys_per_upload); 
+        for k in keys { inv.arg(k); }
+        let _: u64 = inv.invoke_async(&mut conn).await?;
+        Ok(())
+    }
+
+    pub async fn pop_pqdh_otks(&self, user_hash: &str) -> Result<(Option<String>, Option<String>)> {
+        let mut conn = self.connection.clone();
+        let otk_key = format!("otk:{}", user_hash);
+        let kyber_otk_key = format!("kyber_otk:{}", user_hash);
+        
+        let script = redis::Script::new(r"
+            local otk = redis.call('SPOP', KEYS[1])
+            local kyber = redis.call('SPOP', KEYS[2])
+            return {otk, kyber}
+        ");
+
+        let res: Vec<Option<String>> = script
+            .key(otk_key)
+            .key(kyber_otk_key)
+            .invoke_async(&mut conn)
+            .await?;
+
+        if res.len() == 2 {
+            Ok((res[0].clone(), res[1].clone()))
+        } else {
+            Ok((None, None))
+        }
     }
 
     pub async fn pop_otk(&self, user_hash: &str) -> Result<Option<String>> {
@@ -420,6 +477,16 @@ impl RedisManager {
         ";
         let _: i32 = redis::Script::new(script).arg(user_hash).invoke_async(&mut conn).await?;
         Ok(true)
+    }
+
+    pub async fn refresh_nickname_ttl(&self, user_hash: &str) -> Result<()> {
+        let mut conn = self.connection.clone();
+        let owner_key = format!("rn:{}", user_hash);
+        if let Ok(Some(nick)) = conn.get::<_, Option<String>>(&owner_key).await {
+            let _: () = conn.expire(&format!("nick:{}", nick), 2592000).await?;
+            let _: () = conn.expire(&owner_key, 2592000).await?;
+        }
+        Ok(())
     }
 
     pub async fn create_session_token(&self, user_hash: &str, ttl_sec: u64) -> Result<String> {
