@@ -32,7 +32,6 @@ mod telemetry;
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -44,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let redis = RedisManager::new(config.clone()).await?;
     let relay = Arc::new(MessageRelay::new(registry.clone(), redis.clone(), config.clone(), metrics.clone()));
     let identity_handler = Arc::new(IdentityHandler::new(redis.clone(), registry.clone(), config.clone()));
-    let health_handler = Arc::new(HealthHandler::new(config.clone(), registry.clone(), metrics.clone()));
+    let health_handler = Arc::new(HealthHandler::new(config.clone(), registry.clone(), metrics.clone(), redis.clone()));
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -73,8 +72,6 @@ async fn main() -> anyhow::Result<()> {
     info!("Entropy Server v0.1.0 starting on {}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    // IP-BLIND: We no longer need to extract connection info. 
-    // This removes the final dependency on network origin from the request lifecycle.
     axum::serve(listener, app.into_make_service()).await?;
     
     Ok(())

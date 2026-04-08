@@ -22,12 +22,6 @@ impl IdentityHandler {
     }
 
     pub async fn handle_pow_challenge(&self, req: &Value) -> Value {
-        // 🛡️ JAILING ENFORCEMENT
-        if let Some(id_hash) = req.get("identity_hash").or_else(|| req.get("id_hash")).and_then(|h| h.as_str()) {
-            if let Ok(res) = self.redis.check_rate_limit(&format!("limit:relay:uid:{}", id_hash), self.config.relay_limit.into(), 60, 0).await {
-                if res.is_jailed { return json!({"type": "error", "error": "Identity Jailed"}); }
-            }
-        }
 
         let ttl = 60;
         let seed_bytes: [u8; 32] = thread_rng().gen();
@@ -45,20 +39,11 @@ impl IdentityHandler {
         res
     }
 
-    async fn get_required_pow(&self, req: &Value) -> u32 {
+    async fn get_required_pow(&self, _req: &Value) -> u32 {
         let mut penalty = 0;
         let intensity = self.redis.get_registration_intensity().await.unwrap_or(0);
         if intensity > self.config.registration_intensity_low as i32 { penalty = 2; }
         if intensity > self.config.registration_intensity_high as i32 { penalty = 4; }
-        
-        // 🚩 SHADOW PENALTY: Check if identity has recent violations
-        if let Some(id_hash) = req.get("identity_hash").or_else(|| req.get("id_hash")).and_then(|h| h.as_str()) {
-            if let Ok(count) = self.redis.get_identity_violations(id_hash).await {
-                if u64::from(count) >= self.config.identity_violation_threshold {
-                    penalty += 4; // Apply the same shadow penalty as the auth handler
-                }
-            }
-        }
 
         let active_conns = self.registry.connection_count();
         PoWVerifier::get_required_difficulty(self.config.pow_base_difficulty, active_conns, penalty, self.config.max_pow_difficulty as u32)
@@ -99,11 +84,6 @@ impl IdentityHandler {
             response["error"] = json!("Missing identity_hash");
             return response;
         };
-
-        // 🛡️ JAILING ENFORCEMENT
-        if let Ok(res) = self.redis.check_rate_limit(&format!("limit:relay:uid:{}", id_hash), self.config.relay_limit.into(), 60, 0).await {
-            if res.is_jailed { return json!({"type": "error", "error": "Identity Jailed"}); }
-        }
 
         let Some(sig_str) = req.get("signature").and_then(|s| s.as_str()) else {
             response["error"] = json!("Signature required");
@@ -176,7 +156,6 @@ impl IdentityHandler {
         let mut res = json!({ "type": "fetch_key_res" });
         if let Some(rid) = req.get("req_id") { res.as_object_mut().unwrap().insert("req_id".to_string(), rid.clone()); }
 
-        // 🛡️ ANTI-DRAIN: Limit key fetches per identity
         if let Ok(limit_res) = self.redis.check_rate_limit(&format!("limit:keys_f:uid:{}", initiator_hash), self.config.key_fetch_limit.into(), self.config.keys_window_sec, 1).await {
             if !limit_res.allowed { return json!({"type": "error", "error": "Key fetch rate limit exceeded"}); }
         }
@@ -184,7 +163,7 @@ impl IdentityHandler {
         if let Ok(Some(bundle_str)) = self.redis.get_user_bundle(target).await {
             let mut bundle_json: Value = serde_json::from_str(&bundle_str).unwrap_or(json!({}));
             
-            // 🦾 ATOMIC PQ UPGRADE: Pop both standard and Kyber OTKs simultaneously
+            // Pop both standard and Kyber OTKs simultaneously
             if let Ok((otk, kyber_otk)) = self.redis.pop_pqdh_otks(target).await {
                 if let Some(otk_str) = otk {
                     if let Ok(otk_json) = serde_json::from_str::<Value>(&otk_str) {
@@ -198,14 +177,14 @@ impl IdentityHandler {
                 }
             }
 
-            // 🦾 SYNC ALERT: Notify owner if their PreKey pool is running low
+            // Notify owner if their PreKey pool is running low
             if let Ok(count) = self.redis.get_otk_count(target).await {
                 if count < 10 {
                     if let Some(target_tx) = self.registry.get_connection(target) {
                         let alert = json!({ "type": "keys_low", "count": count });
                         let mut alert_str = serde_json::to_string(&alert).unwrap();
                         crate::security::noise::TrafficNormalizer::pad_json_str(&mut alert_str, self.config.pacing.packet_size);
-                        let _ = target_tx.send(crate::relay::QueuedMessage { msg: axum::extract::ws::Message::Text(alert_str.into()) });
+                        let _ = target_tx.send(crate::relay::QueuedMessage { msg: axum::extract::ws::Message::Text(alert_str) });
                     }
                 }
             }
@@ -224,10 +203,7 @@ impl IdentityHandler {
         let nick = InputValidator::normalize_nickname(raw_nick);
         let Some(id_hash) = req.get("identity_hash").and_then(|h| h.as_str()) else { return response; };
 
-        // 🛡️ JAILING ENFORCEMENT
-        if let Ok(res) = self.redis.check_rate_limit(&format!("limit:relay:uid:{}", id_hash), self.config.relay_limit.into(), 60, 0).await {
-            if res.is_jailed { return json!({"type": "error", "error": "Identity Jailed"}); }
-        }
+        // Enforced at WebSocket layer
 
         if let Ok(res) = self.redis.check_rate_limit(&format!("limit:nick:reg:{}", id_hash), self.config.nick_register_limit.into(), 3600, 1).await {
             if !res.allowed { response["error"] = json!("Rate limit exceeded"); return response; }
@@ -238,7 +214,6 @@ impl IdentityHandler {
         let pk_bytes = if pk_val.len() == 64 { hex::decode(pk_val).unwrap_or_default() } else { BASE64.decode(pk_val).unwrap_or_default() };
         let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };
 
-        // ✅ VERIFICATION: Check the signature of the nickname to prove ownership
         let payload = format!("NICKNAME_REGISTER:{}", raw_nick);
         if !InputValidator::verify_xeddsa(&pk_bytes, payload.as_bytes(), &sig_bytes) && 
            !InputValidator::verify_ed25519(&pk_bytes, payload.as_bytes(), &sig_bytes) {
@@ -264,12 +239,11 @@ impl IdentityHandler {
             return json!({"type": "error", "error": "Public key required"});
         };
 
-        // 🛡️ ANTI-SCRAPING: Strictly rate limit lookup per identity
         if let Ok(res) = self.redis.check_rate_limit(&format!("limit:lookup:uid:{}", initiator_hash), self.config.lookup_limit.into(), self.config.relay_window_sec, 1).await {
             if !res.allowed { return json!({"type": "error", "error": "Lookup rate limit exceeded"}); }
         }
 
-        // 🔐 PROOF OF IDENTITY: Verify the requester is who they say they are
+        // Verify the requester is who they say they are
         let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };
         let pk_bytes = if pk_str.len() == 64 { hex::decode(pk_str).unwrap_or_default() } else { BASE64.decode(pk_str).unwrap_or_default() };
         
@@ -297,12 +271,11 @@ impl IdentityHandler {
             return json!({"type": "error", "error": "Public key required"});
         };
 
-        // 🛡️ ANTI-SCRAPING: Strictly rate limit resolution per identity
+        // Strictly rate limit resolution per identity
         if let Ok(res) = self.redis.check_rate_limit(&format!("limit:resolve:uid:{}", initiator_hash), self.config.lookup_limit.into(), self.config.relay_window_sec, 1).await {
             if !res.allowed { return json!({"type": "error", "error": "Resolution rate limit exceeded"}); }
         }
 
-        // 🔐 PROOF OF IDENTITY: Verify the requester is who they say they are
         let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };
         let pk_bytes = if pk_str.len() == 64 { hex::decode(pk_str).unwrap_or_default() } else { BASE64.decode(pk_str).unwrap_or_default() };
         
@@ -325,12 +298,18 @@ impl IdentityHandler {
 
         let payload = format!("BURN_ACCOUNT:{}", id_hash);
         if !InputValidator::verify_xeddsa(&pk_bytes, payload.as_bytes(), &sig_bytes) { 
-            tracing::error!("[Auth] Burn signature verification failed for {}", id_hash);
             return json!({}); 
         }
         match self.redis.nuclear_burn(id_hash).await {
             Ok(_) => json!({ "type": "account_burn_res", "status": "success" }),
             _ => json!({ "type": "error" }),
+        }
+    }
+
+    pub async fn handle_session_revoke(&self, user_hash: &str) -> Value {
+        match self.redis.revoke_session_token(user_hash).await {
+            Ok(_) => json!({ "type": "session_revoke_res", "status": "success" }),
+            Err(_) => json!({ "type": "error", "message": "Revocation failed" }),
         }
     }
 }

@@ -29,8 +29,6 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    // IP-BLIND UPGRADE: Physical IP is strictly transient for transport.
-    // We no longer extract or track ConnectInfo<SocketAddr>.
     ws.max_message_size(state.config.max_message_size)
       .on_upgrade(move |socket| handle_socket(socket, state))
 }
@@ -39,6 +37,7 @@ struct ConnectionGuard {
     state: Arc<AppState>,
     identity_hash: Option<String>,
     authenticated: bool,
+    jailed_until: Option<tokio::time::Instant>,
 }
 
 impl Drop for ConnectionGuard {
@@ -54,7 +53,7 @@ impl Drop for ConnectionGuard {
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
-    state.registry.inc_total(); // Immediate tracking
+    state.registry.inc_total();
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<QueuedMessage>();
 
@@ -62,11 +61,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         state: state.clone(),
         identity_hash: None,
         authenticated: false,
+        jailed_until: None,
     };
     let mut _challenge_solved = false;
     let mut control_assembler: HashMap<u32, FragmentBuffer> = HashMap::new();
 
-    // SECURITY: Limit global total connections (Identity-Agnostic)
     if state.registry.connection_count() >= state.config.max_global_connections {
         state.metrics.increment_counter("global_limit_rejected", 1.0);
         return;
@@ -92,17 +91,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             }
             _ = handshake_check_timer.tick() => {
                 if !guard.authenticated && last_activity.elapsed() > Duration::from_secs(10) {
-                    tracing::warn!("[Security] Handshake Watchdog: Timeout (Slow/No PoW) - Dropping Socket");
                     break 'outer;
                 }
             }
             _ = &mut next_dummy_sleep => {
                 let mut dummy_vec = vec![0u8; state.config.pacing.packet_size];
-                dummy_vec[0] = 0x03; // Type 0x03 Binary Dummy
+                dummy_vec[0] = 0x03; 
                 TrafficNormalizer::pad_binary(&mut dummy_vec, state.config.pacing.packet_size);
                 
 
-                if sender.send(Message::Binary(dummy_vec.into())).await.is_err() { break 'outer; }
+                if sender.send(Message::Binary(dummy_vec)).await.is_err() { break 'outer; }
                 
                 if last_activity.elapsed() > conn_timeout { break 'outer; }
                 next_dummy_sleep = Box::pin(tokio::time::sleep(Duration::from_millis(thread_rng().gen_range(1000..10000))));
@@ -114,7 +112,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     Message::Text(text) => {
                         let frame_size = text.len();
                         if frame_size != state.config.pacing.packet_size {
-                            tracing::warn!("[Security] Stealth Violation: Received Non-Standard Text Frame (size={}) - Prefix: {:?} - Dropping Connection", frame_size, &text[..std::cmp::min(100, text.len())]);
+                            tracing::warn!("[Security] Stealth Violation: Received Non-Standard Text Frame (size={})", frame_size);
                             if let Some(ref id_hash) = guard.identity_hash {
                                 let _ = state.redis.penalize_uid(id_hash, state.config.jail_duration_sec).await;
                             }
@@ -126,45 +124,32 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             continue;
                         }
                         let Ok(val) = serde_json::from_str::<Value>(&text) else { continue; };
-                        match process_command(val, &state, &mut guard, &tx, &mut _challenge_solved, &text).await {
+                        match process_command(val, &state, &mut guard, &tx, &mut _challenge_solved).await {
                             CommandResult::Continue => {},
                             CommandResult::Close => break 'outer,
                             CommandResult::ErrorAndClose(err_val) => {
                                 let mut final_json = serde_json::to_string(&err_val).unwrap();
                                 TrafficNormalizer::pad_json_str(&mut final_json, state.config.pacing.packet_size);
-                                let _ = sender.send(Message::Text(final_json.into())).await;
+                                let _ = sender.send(Message::Text(final_json)).await;
                                 break 'outer;
                             }
                         }
                     }
                     Message::Binary(data) => {
-                        let frame_size = data.len();
-                        if frame_size != state.config.pacing.packet_size {
-                            tracing::warn!("[Security] Stealth Violation: Received Non-Standard Binary Frame (size={}) - Dropping Connection", frame_size);
-                            if let Some(ref id_hash) = guard.identity_hash {
-                                let _ = state.redis.penalize_uid(id_hash, state.config.jail_duration_sec).await;
-                            }
-                            break 'outer; 
-                        }
                         let target_bytes = &data[0..64];
                         let b_type = data[64];
 
-                        // 🛡️ AUTHENTICATED JAIL CHECK (Binary Lane)
-                        if let Some(ref uid) = guard.identity_hash {
-                            if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), state.config.relay_window_sec, 0).await {
-                                if res.is_jailed {
-                                    tracing::warn!("[Security] Dropping Binary from Jailed Identity: {}", uid);
-                                    break 'outer;
+                        if let Some(ref _uid) = guard.identity_hash {
+                            if let Some(until) = guard.jailed_until {
+                                if tokio::time::Instant::now() < until {
+                                    continue; // SILENT DROP
+                                } else {
+                                    guard.jailed_until = None;
                                 }
                             }
                         }
                         
-                        // FAST-DROP 0x03 (Dummy Pacing)
                         if b_type == 0x03 {
-                            // Charge a cost of 1 token even for dummies to prevent pacing-floods
-                            if let Some(ref uid) = guard.identity_hash {
-                                let _ = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), state.config.relay_window_sec, 1).await;
-                            }
                             continue;
                         }
 
@@ -200,51 +185,50 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         continue;
                                     }
                                     if let Ok(val) = serde_json::from_str::<Value>(&cmd_text) {
-                                        match process_command(val, &state, &mut guard, &tx, &mut _challenge_solved, &cmd_text).await {
+                                        match process_command(val, &state, &mut guard, &tx, &mut _challenge_solved).await {
                                             CommandResult::Continue => {},
                                             CommandResult::Close => break 'outer,
                                             CommandResult::ErrorAndClose(err_val) => {
                                                 let mut final_json = serde_json::to_string(&err_val).unwrap();
                                                 TrafficNormalizer::pad_json_str(&mut final_json, state.config.pacing.packet_size);
-                                                let _ = sender.send(Message::Text(final_json.into())).await;
+                                                let _ = sender.send(Message::Text(final_json)).await;
                                                 break 'outer;
                                             }
                                         }
                                     }
                                 }
                             }
-                        } else {
-                            if let Some(uid_hash) = guard.identity_hash.as_ref() {
-                                    let mut target = String::with_capacity(64);
-                                    for &byte in target_bytes { if byte == 0 { break; } target.push(byte as char); }
-                                    let target_hash = target.trim();
-                                    if InputValidator::is_valid_hash(target_hash) {
-                                        // 🛡️ SENDER CHECK: Enforce identity limits (Media or Relay)
-                                        let (sender_limit_key, sender_limit_size) = if b_type == 0x02 {
-                                            (format!("limit:media:uid:{}", uid_hash), state.config.media_limit.into())
-                                        } else {
-                                            (format!("limit:relay:uid:{}", uid_hash), state.config.relay_limit.into())
-                                        };
+                        } else if let Some(uid_hash) = guard.identity_hash.as_ref() {
+                            let mut target = String::with_capacity(64);
+                            for &byte in target_bytes { if byte == 0 { break; } target.push(byte as char); }
+                            let target_hash = target.trim();
+                            if InputValidator::is_valid_hash(target_hash) {
+                                let (sender_limit_key, sender_limit_size) = if b_type == 0x02 {
+                                    (format!("limit:media:uid:{}", uid_hash), state.config.media_limit.into())
+                                } else {
+                                    (format!("limit:relay:uid:{}", uid_hash), state.config.relay_limit.into())
+                                };
 
-                                        if let Ok(res) = state.redis.check_rate_limit(&sender_limit_key, sender_limit_size, state.config.relay_window_sec, 1).await {
-                                            if !res.allowed {
-                                                if res.is_jailed { 
-                                                    let _ = tx.send(QueuedMessage { msg: Message::Text(json!({"type": "error", "error": "Identity Jailed"}).to_string()) });
-                                                    break 'outer; 
-                                                }
-                                                let _ = tx.send(QueuedMessage { msg: Message::Text(json!({"type": "error", "error": "Rate limit exceeded"}).to_string()) });
-                                                continue;
-                                            }
+                                if let Ok(res) = state.redis.check_rate_limit(&sender_limit_key, sender_limit_size, state.config.relay_window_sec, 1).await {
+                                    if !res.allowed {
+                                        if res.is_jailed { 
+                                            guard.jailed_until = Some(tokio::time::Instant::now() + Duration::from_secs(20));
+                                            let _ = tx.send(QueuedMessage { msg: Message::Text(json!({"type": "error", "error": "Identity Jailed"}).to_string()) });
+                                            break 'outer; 
                                         }
-
-                                        // RECIPIENT PROTECTION REMOVED: Forwarding directly to target for unthrottled p2p transit
-                                        if b_type == 0x04 {
-                                            state.relay.relay_volatile(target_hash, &data[64..], uid_hash).await; 
-                                        } else {
-                                            state.relay.relay_binary(target_hash, &data[64..], uid_hash).await; 
-                                        }
+                                        let _ = tx.send(QueuedMessage { msg: Message::Text(json!({"type": "error", "error": "Rate limit exceeded"}).to_string()) });
+                                        continue;
                                     }
-                            } else { tracing::warn!("[Security] Rejected binary relay from unauthenticated socket."); }
+                                }
+
+                                if b_type == 0x04 {
+                                    state.relay.relay_volatile(target_hash, &data[64..], uid_hash).await; 
+                                } else {
+                                    state.relay.relay_binary(target_hash, &data[64..], uid_hash).await; 
+                                }
+                            }
+                        } else {
+                            tracing::warn!("[Security] Malicious Intent: Attempted binary relay before authentication");
                         }
                     }
                     Message::Close(_) => break,
@@ -261,7 +245,6 @@ async fn process_command(
     guard: &mut ConnectionGuard,
     tx: &tokio::sync::mpsc::UnboundedSender<QueuedMessage>,
     _challenge_solved: &mut bool,
-    raw_text: &str,
 ) -> CommandResult {
     let depth = InputValidator::get_json_depth(&val);
     if depth > state.config.max_json_depth { 
@@ -279,19 +262,24 @@ async fn process_command(
 
         TrafficNormalizer::pad_json_str(&mut final_json, state.config.pacing.packet_size);
 
-        let _ = tx.send(QueuedMessage { msg: Message::Text(final_json.into()), });
+        let _ = tx.send(QueuedMessage { msg: Message::Text(final_json), });
     };
 
     if !guard.authenticated && !["pow_challenge", "auth", "dummy_pacing"].contains(&msg_type) {
-        tracing::warn!("[Security] Unauthorized command: {}", msg_type);
         return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Handshake required"}));
     }
-
-    // 🛡️ GLOBAL JAILING CHECK (Any authenticated activity)
     if let Some(ref uid) = guard.identity_hash {
-        // Fix: Changed cost from 0 to 1 to prevent high-frequency Command-Flood DoS
+        if let Some(until) = guard.jailed_until {
+            if tokio::time::Instant::now() < until {
+                return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Identity Jailed"}));
+            } else {
+                guard.jailed_until = None;
+            }
+        }
+
         if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), state.config.relay_window_sec, 1).await {
             if res.is_jailed {
+                guard.jailed_until = Some(tokio::time::Instant::now() + Duration::from_secs(20));
                 return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Identity Jailed"}));
             }
         }
@@ -313,27 +301,11 @@ async fn process_command(
                     if intensity > state.config.registration_intensity_low as i32 { penalty = 2; } 
                     if intensity > state.config.registration_intensity_high as i32 { penalty = 4; }
                     
-                    // 🚩 SHADOW PENALTY: Check if identity has recent violations
-                    if !id_hash_str.is_empty() {
-                        if let Ok(count) = state.redis.get_identity_violations(&id_hash_str).await {
-                            if u64::from(count) >= state.config.identity_violation_threshold { penalty += 4; } // Identity-specific multiplier
-                        }
-                    }
-
                     let req_diff = crate::security::pow::PoWVerifier::get_required_difficulty(state.config.pow_base_difficulty, state.registry.connection_count(), penalty, state.config.max_pow_difficulty as u32);
-                    if payload.get("signature").is_some() {
-                        if state.identity.validate_pow(payload, &id_hash_str, req_diff).await { auth_valid = true; }
-                    }
+                    if payload.get("signature").is_some() && state.identity.validate_pow(payload, &id_hash_str, req_diff).await { auth_valid = true; }
                 }
             }
             if auth_valid && !id_hash_str.is_empty() {
-                // 🛡️ JAILING PRE-CHECK
-                if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", id_hash_str), state.config.relay_limit.into(), state.config.relay_window_sec, 0).await {
-                    if res.is_jailed {
-                        return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Identity Jailed"}));
-                    }
-                }
-
                 if !guard.authenticated { state.metrics.increment_gauge("active_connections", 1.0); }
                 *_challenge_solved = true;
                 guard.authenticated = true;
@@ -399,23 +371,12 @@ async fn process_command(
                 send_response(json!({"type": "error", "error": "Handshake required for account burn"}), tx);
             }
         }
-        _ => {
+        "session_revoke" => {
             if let Some(ref uid) = guard.identity_hash {
-                let is_relay = val.get("target").is_some() || val.get("type").map(|t| t == "text_msg").unwrap_or(false);
-                if is_relay {
-                    if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), state.config.relay_window_sec, 1).await {
-                        if res.allowed { state.relay.relay_message(raw_text, uid).await; }
-                        else {
-                            if res.is_jailed {
-                                return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Identity Jailed"}));
-                            }
-                            send_response(json!({"type": "error", "error": "Rate limit exceeded"}), tx);
-                            return CommandResult::Continue; // Simple rate limit
-                        }
-                    }
-                }
+                send_response(state.identity.handle_session_revoke(uid).await, tx);
             }
         }
+        _ => {}
     }
     CommandResult::Continue
 }

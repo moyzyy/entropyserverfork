@@ -9,22 +9,28 @@ use crate::config::ServerConfig;
 use crate::server::registry::Registry;
 use crate::telemetry::metrics::Metrics;
 
+use crate::db::redis::RedisManager;
+
 pub struct HealthHandler {
     config: Arc<ServerConfig>,
     registry: Arc<Registry>,
     metrics: Arc<Metrics>,
+    redis: Arc<RedisManager>,
 }
 
 impl HealthHandler {
-    pub fn new(config: Arc<ServerConfig>, registry: Arc<Registry>, metrics: Arc<Metrics>) -> Self {
-        Self { config, registry, metrics }
+    pub fn new(config: Arc<ServerConfig>, registry: Arc<Registry>, metrics: Arc<Metrics>, redis: Arc<RedisManager>) -> Self {
+        Self { config, registry, metrics, redis }
     }
 
     pub async fn handle_health(&self) -> Response {
+        let redis_healthy = self.redis.health_check().await;
+        let status = if redis_healthy { "healthy" } else { "degraded" };
+        
         let mut res = Json(json!({
-            "status": "healthy",
-            "storage": "none",
-            "message": "Ephemeral relay only - no data stored"
+            "status": status,
+            "backend": if redis_healthy { "connected" } else { "disconnected" },
+            "message": "Entropy Privacy Relay"
         })).into_response();
         
         self.add_headers(res.headers_mut());
@@ -36,9 +42,15 @@ impl HealthHandler {
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
 
+        let redis_healthy = self.redis.health_check().await;
+        let total_rejections = self.metrics.get_gauge("global_limit_rejected");
+
         let mut res = Json(json!({
             "active_connections": self.registry.connection_count() as i64,
-            "uptime_info": "Server stores ZERO messages"
+            "redis_status": if redis_healthy { "up" } else { "down" },
+            "rejections_since_restart": total_rejections as i64,
+            "privacy_mode": "strict",
+            "uptime_info": "Stateless relay"
         })).into_response();
         
         self.add_headers(res.headers_mut());

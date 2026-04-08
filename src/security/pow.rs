@@ -28,7 +28,7 @@ impl PoWVerifier {
         let Ok(y_bytes) = hex::decode(result_hex) else { return false; };
         let y_claimed = BigUint::from_bytes_be(&y_bytes);
 
-        // 🛡️ THE MAGIC: Verification in O(log T) using Phi
+        // Verification in O(log T) using Phi
         // We need to check if y = x^(2^t) mod n
         // Instead of doing t squarings, we compute e = 2^t mod phi
         let t_big = BigUint::from(difficulty);
@@ -39,5 +39,5 @@ impl PoWVerifier {
         let x: BigUint = BigUint::from_bytes_be(&x_bytes) % &n;
         let expected_y = x.modpow(&e, &n);
         y_claimed == expected_y
-    }
+        }
 }

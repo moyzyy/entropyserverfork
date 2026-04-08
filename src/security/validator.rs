@@ -20,7 +20,7 @@ impl InputValidator {
         let mut normalized = String::with_capacity(trimmed.len());
         let mut last_was_space = false;
         
-        for c in trimmed.chars().take(32) { // Max length enforcement
+        for c in trimmed.chars().take(32) { 
             if c.is_alphanumeric() || c == '_' || c == '-' {
                 normalized.push(c);
                 last_was_space = false;
@@ -65,16 +65,14 @@ impl InputValidator {
         full_pk.insert(0, 0x05);
 
         let Ok(id_key) = IdentityKey::decode(&full_pk) else {
-            tracing::info!("verify_xeddsa: failed to decode IdentityKey (len={})", full_pk.len());
             return false;
         };
 
         if id_key.public_key().verify_signature(message, signature) {
-            tracing::info!("XEdDSA verified successfully using libsignal");
             return true;
         }
 
-        // Fallback to raw Ed25519 check for non-signal keys
+        // Fallback to raw Ed25519 check just in case
         Self::verify_ed25519(&key_32, message, signature)
     }
 
@@ -112,7 +110,7 @@ impl InputValidator {
         }
     }
 
-    /// 🛡️ PRE-SCAN GUARD: Counts raw bracket depth before parsing to avoid Stack Overflow/Nesting Bombs.
+    /// Counts raw bracket depth before parsing to avoid Stack Overflow/Nesting Bombs.
     pub fn pre_scan_depth(input: &str, max_depth: usize) -> bool {
         let mut depth = 0;
         let mut max_observed = 0;

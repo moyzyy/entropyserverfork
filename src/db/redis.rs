@@ -5,6 +5,8 @@ use anyhow::Result;
 use std::time::{SystemTime, UNIX_EPOCH};
 use rand::{thread_rng, RngCore};
 use hex;
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct RateLimitResult {
@@ -18,6 +20,8 @@ pub struct RateLimitResult {
 pub struct RedisManager {
     connection: redis::aio::MultiplexedConnection,
     config: Arc<ServerConfig>,
+    cached_intensity: AtomicI32,
+    last_intensity_check: AtomicU64,
 }
 
 impl RedisManager {
@@ -28,9 +32,17 @@ impl RedisManager {
         let manager = Arc::new(Self {
             connection,
             config: config.clone(),
+            cached_intensity: AtomicI32::new(0),
+            last_intensity_check: AtomicU64::new(0),
         });
 
         Ok(manager)
+    }
+
+    pub async fn health_check(&self) -> bool {
+        let mut conn = self.connection.clone();
+        let res: Result<String, _> = redis::cmd("PING").query_async(&mut conn).await;
+        res.is_ok()
     }
 
 
@@ -48,15 +60,12 @@ impl RedisManager {
             local violation_threshold = tonumber(ARGV[7])
             
             local emission_interval = period / burst
-            local jail_key = key .. ':jail'
             local violation_key = key .. ':viol'
             
-            -- 🛡️ UNIVERSAL JAIL CHECK: If ANY action spammed, the identity is banned
+            local jail_key = key .. ':jail'
             local uid_start = key:find(':uid:')
             if uid_start then
-               local global_jail = 'limit:relay' .. key:sub(uid_start) .. ':jail'
-               local global_ttl = redis.call('TTL', global_jail)
-               if global_ttl > 0 then return {-1, 0, global_ttl} end
+               jail_key = 'limit:relay' .. key:sub(uid_start) .. ':jail'
             end
 
             local jail_ttl = redis.call('TTL', jail_key)
@@ -77,12 +86,8 @@ impl RedisManager {
                 if viol == 1 then redis.call('EXPIRE', violation_key, period * 2) end
                 
                 if viol > violation_threshold then
-                    -- 🔐 BAN THE IDENTITY: Set both the specific and global jail keys
+                    -- 🔐 NUCLEAR BAN: Set the global identity jail
                     redis.call('SETEX', jail_key, jail_duration, 'banned')
-                    if uid_start then
-                        local global_jail = 'limit:relay' .. key:sub(uid_start) .. ':jail'
-                        redis.call('SETEX', global_jail, jail_duration, 'banned')
-                    end
                     return {-1, 0, jail_duration}
                 end
                 
@@ -102,11 +107,6 @@ impl RedisManager {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs_f64();
         let jail_duration = self.config.jail_duration_sec;
-         
-        if self.config.jail_duration_sec > 0 {
-             // Debug print only if log is visible
-             // println!("[Redis] Checking Rate Limit: {} (threshold={})", key, self.config.violation_jail_threshold);
-        }
 
         let result: Vec<i64> = script
             .key(key)
@@ -196,8 +196,6 @@ impl RedisManager {
             local limit = tonumber(ARGV[2])
             local sender_limit = tonumber(ARGV[3])
             local ttl = tonumber(ARGV[4])
-            
-            -- 🛡️ ATOMIC PROTECTION: One check to rule them all
             local global_count = redis.call('LLEN', msg_key)
             if global_count >= limit then
                 return {err = 'ERR_MAILBOX_FULL'}
@@ -259,8 +257,7 @@ impl RedisManager {
     pub async fn store_user_bundle(&self, user_hash: &str, bundle_json: &str) -> Result<()> {
         let mut conn = self.connection.clone();
         let key = format!("keys:{}", user_hash);
-        let _: () = conn.set(&key, bundle_json).await?;
-        let _: () = conn.expire(&key, 2592000).await?;
+        let _: () = conn.set_ex(&key, bundle_json, 2592000).await?;
         let _: () = conn.sadd("active_users", user_hash).await?;
         let _: () = conn.expire("active_users", 2592000).await?;
         self.mark_id_seen(user_hash).await?;
@@ -286,25 +283,24 @@ impl RedisManager {
             local current_count = redis.call('SCARD', key)
             
             local slots_available = limit - current_count
-            if slots_available <= 0 then
-                return 0
+            if slots_available <= 0 then return 0 end
+            
+            local to_add = {}
+            for i = 2, #ARGV do
+                if #to_add >= slots_available then break end
+                table.insert(to_add, ARGV[i])
             end
             
-            local added = 0
-            for i = 2, #ARGV do
-                if added >= slots_available then
-                    break
-                end
-                redis.call('SADD', key, ARGV[i])
-                added = added + 1
+            if #to_add > 0 then
+                redis.call('SADD', key, unpack(to_add))
             end
             
             redis.call('EXPIRE', key, 2592000)
-            return added
+            return #to_add
         "#);
 
         let mut inv = script.key(&key);
-        inv.arg(self.config.max_prekeys_per_upload); // The limit
+        inv.arg(self.config.max_prekeys_per_upload); // limit
         for k in keys { inv.arg(k); }
         
         let _: u64 = inv.invoke_async(&mut conn).await?;
@@ -321,14 +317,19 @@ impl RedisManager {
             local current_count = redis.call('SCARD', key)
             local slots_available = limit - current_count
             if slots_available <= 0 then return 0 end
-            local added = 0
+            
+            local to_add = {}
             for i = 2, #ARGV do
-                if added >= slots_available then break end
-                redis.call('SADD', key, ARGV[i])
-                added = added + 1
+                if #to_add >= slots_available then break end
+                table.insert(to_add, ARGV[i])
             end
+            
+            if #to_add > 0 then
+                redis.call('SADD', key, unpack(to_add))
+            end
+            
             redis.call('EXPIRE', key, 2592000)
-            return added
+            return #to_add
         "#);
         let mut inv = script.key(&key);
         inv.arg(self.config.max_prekeys_per_upload); 
@@ -393,8 +394,7 @@ impl RedisManager {
             let _: () = conn.del(format!("nick:{}", old_name)).await?;
         }
         let _: () = conn.expire(&new_key, 2592000).await?;
-        let _: () = conn.set(&owner_key, nickname).await?;
-        let _: () = conn.expire(&owner_key, 2592000).await?;
+        let _: () = conn.set_ex(&owner_key, nickname, 2592000).await?;
         Ok(true)
     }
 
@@ -416,21 +416,10 @@ impl RedisManager {
         let mut conn = self.connection.clone();
         let key = format!("seen:{}", user_hash);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let _: () = conn.set(&key, now).await?;
-        let _: () = conn.expire(&key, 2592000).await?;
+        let _: () = conn.set_ex(&key, now, 2592000).await?;
         Ok(())
     }
 
-    pub async fn get_account_age(&self, user_hash: &str) -> Result<i64> {
-        let mut conn = self.connection.clone();
-        let key = format!("seen:{}", user_hash);
-        let val: Option<String> = conn.get(key).await?;
-        if let Some(first_seen_str) = val {
-            let first_seen: i64 = first_seen_str.parse().unwrap_or(0);
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-            Ok(now - first_seen)
-        } else { Ok(0) }
-    }
 
     pub async fn get_identity_violations(&self, user_hash: &str) -> Result<u32> {
         let mut conn = self.connection.clone();
@@ -440,6 +429,14 @@ impl RedisManager {
     }
 
     pub async fn get_registration_intensity(&self) -> Result<i32> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let last_check = self.last_intensity_check.load(Ordering::Relaxed);
+        
+        // Return cached value if it's less than 10 seconds old
+        if now < last_check + 10 {
+            return Ok(self.cached_intensity.load(Ordering::Relaxed));
+        }
+
         let mut conn = self.connection.clone();
         let mut cursor = 0i64;
         let mut keys = Vec::new();
@@ -449,7 +446,12 @@ impl RedisManager {
             cursor = next_cursor;
             if cursor == 0 || keys.len() >= 500 { break; }
         }
-        Ok(keys.len() as i32)
+        
+        let intensity = keys.len() as i32;
+        self.cached_intensity.store(intensity, Ordering::Relaxed);
+        self.last_intensity_check.store(now, Ordering::Relaxed);
+        
+        Ok(intensity)
     }
 
     pub async fn nuclear_burn(&self, user_hash: &str) -> Result<bool> {
@@ -494,9 +496,21 @@ impl RedisManager {
         let mut bytes = [0u8; 32];
         thread_rng().fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
+
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let token_hash = hex::encode(hasher.finalize());
+        
         let key = format!("sess:{}", user_hash);
-        let _: () = conn.set_ex(&key, &token, ttl_sec).await?;
+        let _: () = conn.set_ex(&key, &token_hash, ttl_sec).await?;
         Ok(token)
+    }
+
+    pub async fn revoke_session_token(&self, user_hash: &str) -> Result<()> {
+        let mut conn = self.connection.clone();
+        let key = format!("sess:{}", user_hash);
+        let _: () = conn.del(&key).await?;
+        Ok(())
     }
 
     pub async fn verify_session_token(&self, user_hash: &str, token: &str) -> Result<bool> {
@@ -504,8 +518,12 @@ impl RedisManager {
         let mut conn = self.connection.clone();
         let key = format!("sess:{}", user_hash);
         let val: Option<String> = conn.get(&key).await?;
-        if let Some(stored_token) = val {
-            return Ok(Self::constant_time_eq(stored_token.as_bytes(), token.as_bytes()));
+        if let Some(stored_hash) = val {
+            let mut hasher = Sha256::new();
+            hasher.update(token.as_bytes());
+            let token_hash = hex::encode(hasher.finalize());
+            
+            return Ok(Self::constant_time_eq(stored_hash.as_bytes(), token_hash.as_bytes()));
         }
         Ok(false)
     }
