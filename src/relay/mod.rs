@@ -51,6 +51,7 @@ impl MessageRelay {
             };
             
             if recipient_tx.send(msg).is_ok() {
+                if data.len() < 13 { return; }
                 let transfer_id = u32::from_be_bytes(data[1..5].try_into().unwrap_or([0;4]));
                 let index = u32::from_be_bytes(data[5..9].try_into().unwrap_or([0;4]));
                 let total = u32::from_be_bytes(data[9..13].try_into().unwrap_or([1;4]));
@@ -67,6 +68,7 @@ impl MessageRelay {
                 }
             }
         } else {
+            if data.len() < 5 { return; }
             let transfer_id = u32::from_be_bytes(data[1..5].try_into().unwrap_or([0;4]));
             if frame_type == 0x02 {
                 self.notify_error_direct(sender_hash, Some(target_hash), "media_offline", "Recipient is offline. Media fragments were dropped.", Some(transfer_id)).await;

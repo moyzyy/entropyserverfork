@@ -90,7 +90,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 cleanup_timer = Box::pin(tokio::time::sleep(Duration::from_secs(30)));
             }
             _ = handshake_check_timer.tick() => {
-                if !guard.authenticated && last_activity.elapsed() > Duration::from_secs(10) {
+                if !guard.authenticated && last_activity.elapsed() > Duration::from_secs(state.config.handshake_timeout_sec) {
                     break 'outer;
                 }
             }
@@ -150,6 +150,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
                         
                         if b_type == 0x03 {
+                            continue;
+                        }
+
+                        if data.len() < 81 {
+                            tracing::warn!("[Security] Binary frame too short ({}) - Dropping", data.len());
                             continue;
                         }
 

@@ -130,3 +130,38 @@ impl InputValidator {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nickname_normalization() {
+        assert_eq!(InputValidator::normalize_nickname("  Hello_World  "), "Hello_World");
+        assert_eq!(InputValidator::normalize_nickname("Multiple   Spaces"), "Multiple Spaces");
+        assert_eq!(InputValidator::normalize_nickname("Special!@#Characters"), "SpecialCharacters");
+        assert_eq!(InputValidator::normalize_nickname("VeryLongNicknameThatIsOverThirtyTwoCharacters"), "VeryLongNicknameThatIsOverThirty");
+    }
+
+    #[test]
+    fn test_hex_validation() {
+        assert!(InputValidator::is_valid_hex("abc123DEF", None));
+        assert!(InputValidator::is_valid_hex("abc123DEF", Some(9)));
+        assert!(!InputValidator::is_valid_hex("abc123DEG", None)); // G is not hex
+        assert!(!InputValidator::is_valid_hex("abc", Some(4))); // Wrong length
+    }
+
+    #[test]
+    fn test_pre_scan_depth() {
+        assert!(InputValidator::pre_scan_depth("{}", 5));
+        assert!(InputValidator::pre_scan_depth("[[[[]]]]", 5));
+        assert!(!InputValidator::pre_scan_depth("[[[[]]]]", 3)); // Depth is 4
+        assert!(InputValidator::pre_scan_depth("no brackets", 0));
+    }
+
+    #[test]
+    fn test_sanitize_field() {
+        assert_eq!(InputValidator::sanitize_field("drop table users;", 10), "drop table");
+        assert_eq!(InputValidator::sanitize_field("valid-name_123", 20), "valid-name_123");
+    }
+}

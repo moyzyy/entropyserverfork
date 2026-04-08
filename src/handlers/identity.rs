@@ -215,6 +215,10 @@ impl IdentityHandler {
         let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };
 
         let payload = format!("NICKNAME_REGISTER:{}", raw_nick);
+        if !InputValidator::verify_id_hash(id_hash, &pk_bytes) {
+            return json!({"type": "error", "error": "Identity mismatch: Public key does not match hash"});
+        }
+        
         if !InputValidator::verify_xeddsa(&pk_bytes, payload.as_bytes(), &sig_bytes) && 
            !InputValidator::verify_ed25519(&pk_bytes, payload.as_bytes(), &sig_bytes) {
                return json!({"type": "error", "error": "Ownership proof failed"});

@@ -20,3 +20,29 @@ impl TrafficNormalizer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_json_padding() {
+        let mut s = "{\"a\":1}".to_string(); // len 7
+        TrafficNormalizer::pad_json_str(&mut s, 10);
+        assert_eq!(s.len(), 10);
+        assert_eq!(s, "{\"a\":1}   ");
+        
+        // No truncation
+        TrafficNormalizer::pad_json_str(&mut s, 5);
+        assert_eq!(s.len(), 10);
+    }
+
+    #[test]
+    fn test_binary_padding() {
+        let mut b = vec![1, 2, 3];
+        TrafficNormalizer::pad_binary(&mut b, 5);
+        assert_eq!(b.len(), 5);
+        assert_eq!(b[3], 0);
+        assert_eq!(b[4], 0);
+    }
+}

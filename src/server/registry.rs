@@ -45,3 +45,37 @@ impl Registry {
         self.connections.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_registry_lifecycle() {
+        let registry = Registry::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        
+        // Initial state
+        assert_eq!(registry.connection_count(), 0);
+        
+        // Add connection
+        registry.add_connection("user1".to_string(), tx);
+        assert!(registry.get_connection("user1").is_some());
+        
+        // Displacement
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let old = registry.add_connection("user1".to_string(), tx2);
+        assert!(old.is_some(), "Should return the old sender");
+        
+        // Atomic counts
+        registry.inc_total();
+        registry.inc_total();
+        assert_eq!(registry.connection_count(), 2);
+        registry.dec_total();
+        assert_eq!(registry.connection_count(), 1);
+        
+        // Removal
+        registry.remove_connection("user1");
+        assert!(registry.get_connection("user1").is_none());
+    }
+}

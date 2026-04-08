@@ -463,6 +463,12 @@ impl RedisManager {
             redis.call('DEL', 'rn:' .. id)
             redis.call('DEL', 'keys:' .. id)
             redis.call('DEL', 'msg:' .. id)
+            local senders = redis.call('SMEMBERS', 'offsenders:' .. id)
+            for _, sc_key in ipairs(senders) do
+                redis.call('DEL', sc_key)
+            end
+            redis.call('DEL', 'offsenders:' .. id)
+            
             redis.call('DEL', 'sess:' .. id)
             redis.call('DEL', 'seen:' .. id)
             redis.call('DEL', 'otk:' .. id)
@@ -547,5 +553,36 @@ impl RedisManager {
         let key = format!("pow_seed:{}", seed);
         let deleted: i64 = conn.del(&key).await?;
         Ok(deleted > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServerConfig;
+
+    async fn setup_redis() -> Arc<RedisManager> {
+        let config = Arc::new(ServerConfig::test_default());
+        RedisManager::new(config).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_session_token_validation() {
+        let redis = setup_redis().await;
+        let user = "test_user_token";
+        
+        let token = redis.create_session_token(user, 10).await.unwrap();
+        assert!(redis.verify_session_token(user, &token).await.unwrap());
+        assert!(!redis.verify_session_token(user, "wrong_token").await.unwrap());
+        
+        redis.revoke_session_token(user).await.unwrap();
+        assert!(!redis.verify_session_token(user, &token).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_constant_time_eq() {
+        assert!(RedisManager::constant_time_eq(b"password", b"password"));
+        assert!(!RedisManager::constant_time_eq(b"password", b"wrongpas"));
+        assert!(!RedisManager::constant_time_eq(b"abc", b"abcd"));
     }
 }
