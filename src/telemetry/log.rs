@@ -22,10 +22,10 @@ pub struct SecurityLogger;
 impl SecurityLogger {
     pub fn log(level: LogLevel, event: EventType, remote_addr: &str, message: &str) {
         let level_str = match level {
-            LogLevel::INFO => "INFO",
-            LogLevel::WARNING => "WARNING",
-            LogLevel::ERROR => "ERROR",
-            LogLevel::CRITICAL => "CRITICAL",
+            LogLevel::Info => "INFO",
+            LogLevel::Warning => "WARNING",
+            LogLevel::Error => "ERROR",
+            LogLevel::Critical => "CRITICAL",
         };
 
         let event_str = match event {
@@ -37,9 +37,9 @@ impl SecurityLogger {
         };
 
         match level {
-            LogLevel::INFO => info!("[{}] [{}] {} - {}", level_str, event_str, remote_addr, message),
-            LogLevel::WARNING => warn!("[{}] [{}] {} - {}", level_str, event_str, remote_addr, message),
-            LogLevel::ERROR | LogLevel::CRITICAL => error!("[{}] [{}] {} - {}", level_str, event_str, remote_addr, message),
+            LogLevel::Info => info!("[{}] [{}] {} - {}", level_str, event_str, remote_addr, message),
+            LogLevel::Warning => warn!("[{}] [{}] {} - {}", level_str, event_str, remote_addr, message),
+            LogLevel::Error | LogLevel::Critical => error!("[{}] [{}] {} - {}", level_str, event_str, remote_addr, message),
         }
     }
 }

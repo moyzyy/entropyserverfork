@@ -7,10 +7,10 @@ use chrono::Utc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(dead_code)]
 pub enum LogLevel {
-    INFO,
-    WARNING,
-    ERROR,
-    CRITICAL,
+    Info,
+    Warning,
+    Error,
+    Critical,
 }
 
 #[allow(dead_code)]
@@ -41,10 +41,10 @@ struct LoggerState {
 #[allow(dead_code)]
 static STATE: Lazy<Arc<Mutex<LoggerState>>> = Lazy::new(|| {
     let min_level = match std::env::var("ENTROPY_LOG_LEVEL").unwrap_or_default().as_str() {
-        "CRITICAL" => LogLevel::CRITICAL,
-        "ERROR" => LogLevel::ERROR,
-        "WARNING" => LogLevel::WARNING,
-        _ => LogLevel::INFO,
+        "CRITICAL" => LogLevel::Critical,
+        "ERROR" => LogLevel::Error,
+        "WARNING" => LogLevel::Warning,
+        _ => LogLevel::Info,
     };
     
     let mut salt_bytes = [0u8; 32];
@@ -75,10 +75,10 @@ impl SecurityLogger {
         }
 
         let level_str = match level {
-            LogLevel::INFO => "INFO",
-            LogLevel::WARNING => "WARN",
-            LogLevel::ERROR => "ERROR",
-            LogLevel::CRITICAL => "CRIT",
+            LogLevel::Info => "INFO",
+            LogLevel::Warning => "WARN",
+            LogLevel::Error => "ERROR",
+            LogLevel::Critical => "CRIT",
         };
 
         let event_str = match event {
@@ -103,7 +103,7 @@ impl SecurityLogger {
             sanitized_msg
         );
 
-        if level >= LogLevel::ERROR {
+        if level >= LogLevel::Error {
             eprintln!("{}", log_line);
         } else {
             println!("{}", log_line);

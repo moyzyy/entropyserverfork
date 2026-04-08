@@ -8,11 +8,28 @@ impl InputValidator {
     pub fn sanitize_field(input: &str, max_len: usize) -> String {
         let mut result = String::with_capacity(input.len().min(max_len));
         for c in input.chars().take(max_len) {
-            if c.is_alphanumeric() || c == '_' || c == '-' {
+            if c.is_alphanumeric() || c == '_' || c == '-' || c == ' ' {
                 result.push(c);
             }
         }
         result
+    }
+
+    pub fn normalize_nickname(input: &str) -> String {
+        let trimmed = input.trim();
+        let mut normalized = String::with_capacity(trimmed.len());
+        let mut last_was_space = false;
+        
+        for c in trimmed.chars().take(32) { // Max length enforcement
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                normalized.push(c);
+                last_was_space = false;
+            } else if c == ' ' && !last_was_space {
+                normalized.push(' ');
+                last_was_space = true;
+            }
+        }
+        normalized
     }
 
     pub fn is_valid_hex(input: &str, expected_len: Option<usize>) -> bool {
@@ -107,7 +124,7 @@ impl InputValidator {
                     if depth > max_depth { return false; }
                 }
                 '}' | ']' => {
-                    if depth > 0 { depth -= 1; }
+                    depth = depth.saturating_sub(1);
                 }
                 _ => {}
             }

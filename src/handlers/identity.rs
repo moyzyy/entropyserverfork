@@ -220,7 +220,8 @@ impl IdentityHandler {
 
     pub async fn handle_nickname_register(&self, req: &Value) -> Value {
         let mut response = json!({"type": "error", "status": "error"});
-        let Some(nick) = req.get("nickname").and_then(|n| n.as_str()) else { return response; };
+        let Some(raw_nick) = req.get("nickname").and_then(|n| n.as_str()) else { return response; };
+        let nick = InputValidator::normalize_nickname(raw_nick);
         let Some(id_hash) = req.get("identity_hash").and_then(|h| h.as_str()) else { return response; };
 
         // 🛡️ JAILING ENFORCEMENT
@@ -237,20 +238,22 @@ impl IdentityHandler {
         let pk_bytes = if pk_val.len() == 64 { hex::decode(pk_val).unwrap_or_default() } else { BASE64.decode(pk_val).unwrap_or_default() };
         let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };
 
-        let payload = format!("NICKNAME_REGISTER:{}", nick);
+        // ✅ VERIFICATION: Check the signature of the nickname to prove ownership
+        let payload = format!("NICKNAME_REGISTER:{}", raw_nick);
         if !InputValidator::verify_xeddsa(&pk_bytes, payload.as_bytes(), &sig_bytes) && 
            !InputValidator::verify_ed25519(&pk_bytes, payload.as_bytes(), &sig_bytes) {
                return json!({"type": "error", "error": "Ownership proof failed"});
         }
 
-        match self.redis.register_nickname(nick, id_hash).await {
+        match self.redis.register_nickname(&nick, id_hash).await {
             Ok(true) => json!({ "type": "nickname_register_res", "status": "success" }),
             _ => json!({ "type": "error", "error": "Nickname already taken" }),
         }
     }
 
     pub async fn handle_nickname_lookup(&self, req: &Value) -> Value {
-        let Some(name) = req.get("name").and_then(|n| n.as_str()) else { return json!({}); };
+        let Some(raw_name) = req.get("name").and_then(|n| n.as_str()) else { return json!({}); };
+        let name = InputValidator::normalize_nickname(raw_name);
         let Some(initiator_hash) = req.get("initiator_hash").and_then(|h| h.as_str()) else {
             return json!({"type": "error", "error": "Initiator hash required"});
         };
@@ -270,13 +273,13 @@ impl IdentityHandler {
         let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };
         let pk_bytes = if pk_str.len() == 64 { hex::decode(pk_str).unwrap_or_default() } else { BASE64.decode(pk_str).unwrap_or_default() };
         
-        let payload = format!("LOOKUP_NICKNAME:{}", name);
+        let payload = format!("LOOKUP_NICKNAME:{}", raw_name);
         if !InputValidator::verify_xeddsa(&pk_bytes, payload.as_bytes(), &sig_bytes) &&
            !InputValidator::verify_ed25519(&pk_bytes, payload.as_bytes(), &sig_bytes) {
                return json!({"type": "error", "error": "Initiator signature invalid"});
         }
 
-        let h = self.redis.resolve_nickname(name).await.unwrap_or_default();
+        let h = self.redis.resolve_nickname(&name).await.unwrap_or_default();
         let mut res = json!({ "type": "nickname_lookup_res" });
         if let Some(target) = h { res.as_object_mut().unwrap().insert("identity_hash".to_string(), json!(target)); }
         res

@@ -142,7 +142,7 @@ impl RedisManager {
                     is_jailed: true,
                 })
             } else {
-                let current = (limit as i64).saturating_sub(val1); 
+                let current = limit.saturating_sub(val1); 
                 
                 if key.contains(":uid:") {
                     let parts: Vec<&str> = key.split(':').collect();
@@ -381,7 +381,7 @@ impl RedisManager {
         let existing_nick: Option<String> = conn.get(&owner_key).await?;
         if let Some(ref old_name) = existing_nick {
             if old_name == nickname {
-                let _: () = conn.expire(&format!("nick:{}", nickname), 2592000).await?;
+                let _: () = conn.expire(format!("nick:{}", nickname), 2592000).await?;
                 let _: () = conn.expire(&owner_key, 2592000).await?;
                 return Ok(true);
             }
@@ -390,7 +390,7 @@ impl RedisManager {
         let success: bool = conn.set_nx(&new_key, user_hash).await?;
         if !success { return Ok(false); }
         if let Some(old_name) = existing_nick {
-            let _: () = conn.del(&format!("nick:{}", old_name)).await?;
+            let _: () = conn.del(format!("nick:{}", old_name)).await?;
         }
         let _: () = conn.expire(&new_key, 2592000).await?;
         let _: () = conn.set(&owner_key, nickname).await?;
@@ -483,7 +483,7 @@ impl RedisManager {
         let mut conn = self.connection.clone();
         let owner_key = format!("rn:{}", user_hash);
         if let Ok(Some(nick)) = conn.get::<_, Option<String>>(&owner_key).await {
-            let _: () = conn.expire(&format!("nick:{}", nick), 2592000).await?;
+            let _: () = conn.expire(format!("nick:{}", nick), 2592000).await?;
             let _: () = conn.expire(&owner_key, 2592000).await?;
         }
         Ok(())
