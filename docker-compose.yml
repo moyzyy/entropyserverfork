@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  entropy:
+    build: .
+    container_name: entropy_relay
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env.production
+    environment:
+      - ENTROPY_ADDR=0.0.0.0
+      - ENTROPY_REDIS_URL=redis://cache:6379
+    depends_on:
+      - cache
+    restart: always
+
+  cache:
+    image: redis:7-alpine
+    container_name: entropy_redis
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    restart: always
+
+volumes:
+  redis_data:

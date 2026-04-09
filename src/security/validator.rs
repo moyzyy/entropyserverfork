@@ -1,6 +1,7 @@
+use tracing::warn;
+use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use sha2::{Sha256, Digest};
-use libsignal_protocol::IdentityKey;
 
 pub struct InputValidator;
 
@@ -57,23 +58,33 @@ impl InputValidator {
         if key_32.len() == 33 && key_32[0] == 0x05 {
             key_32.remove(0);
         }
-        
-        if key_32.len() != 32 || signature.len() != 64 { return false; }
-        
-        // Use libsignal directly for XEdDSA verification parity
-        let mut full_pk = key_32.clone();
-        full_pk.insert(0, 0x05);
-
-        let Ok(id_key) = IdentityKey::decode(&full_pk) else {
+        if key_32.len() != 32 || signature.len() != 64 {
             return false;
-        };
-
-        if id_key.public_key().verify_signature(message, signature) {
-            return true;
         }
 
-        // Fallback to raw Ed25519 check just in case
-        Self::verify_ed25519(&key_32, message, signature)
+        let Ok(pk_bytes): Result<[u8; 32], _> = key_32.try_into() else { return false; };
+        let u = MontgomeryPoint(pk_bytes);
+
+        // Mask the high bit of s (the last byte of the 64-byte signature)
+        let mut sig_fixed = [0u8; 64];
+        sig_fixed.copy_from_slice(signature);
+        sig_fixed[63] &= 0x7F;
+
+        for sign_bit in [0u8, 1u8] {
+            if let Some(ep) = u.to_edwards(sign_bit) {
+                let ed_bytes = ep.compress().to_bytes();
+                if let Ok(vk) = VerifyingKey::from_bytes(&ed_bytes) {
+                    if let Ok(sig) = ed25519_dalek::Signature::from_slice(&sig_fixed) {
+                        if vk.verify(message, &sig).is_ok() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        warn!("[Security] All XEdDSA verification paths failed for pk={}", hex::encode(pk_bytes));
+        false
     }
 
     pub fn verify_ed25519(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
@@ -82,6 +93,8 @@ impl InputValidator {
             key_32.remove(0);
         }
         if key_32.len() != 32 { return false; }
+        
+        // Silent decoding for internal attempts
         let Ok(key) = VerifyingKey::from_bytes(key_32.as_slice().try_into().unwrap_or(&[0;32])) else { 
             return false; 
         };

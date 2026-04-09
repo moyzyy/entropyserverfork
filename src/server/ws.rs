@@ -10,6 +10,7 @@ use tokio::time::Duration;
 use rand::{thread_rng, Rng};
 use crate::security::noise::TrafficNormalizer;
 use crate::security::validator::InputValidator;
+use tracing::warn;
 use crate::relay::QueuedMessage;
 use std::collections::HashMap;
 
@@ -298,7 +299,12 @@ async fn process_command(
             if let Some(payload) = val.get("payload") {
                 id_hash_str = payload.get("identity_hash").and_then(|h| h.as_str()).map(|s| InputValidator::sanitize_field(s, 256)).unwrap_or_default();
                 if let Some(token) = payload.get("session_token").and_then(|t| t.as_str()) {
-                    if state.redis.verify_session_token(&id_hash_str, token).await.unwrap_or(false) { auth_valid = true; }
+                    if state.redis.verify_session_token(&id_hash_str, token).await.unwrap_or(false) { 
+                        auth_valid = true; 
+                    } else {
+                        state.metrics.increment_counter("auth_failures_total", 1.0);
+                        warn!("[WS Auth] Session token verification failed for id={}", id_hash_str);
+                    }
                 }
                 if !auth_valid {
                     let intensity = state.redis.get_registration_intensity().await.unwrap_or(0);
@@ -307,9 +313,21 @@ async fn process_command(
                     if intensity > state.config.registration_intensity_high as i32 { penalty = 4; }
                     
                     let req_diff = crate::security::pow::PoWVerifier::get_required_difficulty(state.config.pow_base_difficulty, state.registry.connection_count(), penalty, state.config.max_pow_difficulty as u32);
-                    if payload.get("signature").is_some() && state.identity.validate_pow(payload, &id_hash_str, req_diff).await { auth_valid = true; }
+                    if payload.get("signature").is_some() {
+                        if state.identity.validate_pow(payload, &id_hash_str, req_diff).await { 
+                            auth_valid = true; 
+                        } else {
+                            state.metrics.increment_counter("auth_failures_total", 1.0);
+                            warn!("[WS Auth] PoW/Signature verification failed for id={}", id_hash_str);
+                        }
+                    } else {
+                        warn!("[WS Auth] No signature provided in auth payload for id={}", id_hash_str);
+                    }
                 }
+            } else {
+                warn!("[WS Auth] Missing payload in auth message");
             }
+
             if auth_valid && !id_hash_str.is_empty() {
                 if !guard.authenticated { state.metrics.increment_gauge("active_connections", 1.0); }
                 *_challenge_solved = true;
@@ -317,7 +335,6 @@ async fn process_command(
                 guard.identity_hash = Some(id_hash_str.clone());
 
                 if let Some(old_tx) = state.registry.add_connection(id_hash_str.clone(), tx.clone()) {
-
                     let _ = old_tx.send(QueuedMessage { msg: Message::Close(None) });
                 }
 
@@ -335,10 +352,11 @@ async fn process_command(
                     "otk_count": otk_count
                 });
                 
-
                 send_response(response, tx);
                 state.relay.deliver_pending(&id_hash_str, tx.clone()).await;
             } else {
+                state.metrics.increment_counter("auth_failures_total", 1.0);
+                warn!("[WS Auth] Authentication FAILED for id={}", id_hash_str);
                 let mut err_res = json!({"type": "error", "error": "Handshake failed", "code": "auth_failed"});
                 if let Some(rid) = req_id { err_res["req_id"] = rid; }
                 return CommandResult::ErrorAndClose(err_res);

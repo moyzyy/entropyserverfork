@@ -6,6 +6,7 @@ use std::fmt::Write;
 pub struct Metrics {
     counters: DashMap<String, AtomicU64>,
     gauges: DashMap<String, AtomicU64>,
+    start_time: std::time::Instant,
 }
 
 impl Metrics {
@@ -13,7 +14,12 @@ impl Metrics {
         Arc::new(Self {
             counters: DashMap::new(),
             gauges: DashMap::new(),
+            start_time: std::time::Instant::now(),
         })
+    }
+
+    pub fn uptime_sec(&self) -> u64 {
+        self.start_time.elapsed().as_secs()
     }
 
     pub fn increment_counter(&self, name: &str, value: f64) {
@@ -39,6 +45,10 @@ impl Metrics {
 
     pub fn get_gauge(&self, name: &str) -> f64 {
         self.gauges.get(name).map(|v| v.load(Ordering::Relaxed) as f64).unwrap_or(0.0)
+    }
+
+    pub fn get_counter(&self, name: &str) -> f64 {
+        self.counters.get(name).map(|v| v.load(Ordering::Relaxed) as f64).unwrap_or(0.0)
     }
 
     pub fn collect_prometheus(&self) -> String {

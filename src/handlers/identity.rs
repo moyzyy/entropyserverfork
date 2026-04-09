@@ -8,6 +8,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::{thread_rng, Rng};
 use hex;
 use sha2::{Sha256, Digest};
+use tracing::warn;
 use crate::config::ServerConfig;
 
 pub struct IdentityHandler {
@@ -50,28 +51,52 @@ impl IdentityHandler {
     }
 
     pub async fn validate_pow(&self, obj: &Value, context: &str, target_difficulty: u32) -> bool {
-        let Some(seed) = obj.get("seed").and_then(|s| s.as_str()) else { return false; };
-        let Some(nonce) = obj.get("nonce").and_then(|n| n.as_str().map(|s| s.to_string())) else { return false; };
+        let Some(seed) = obj.get("seed").and_then(|s| s.as_str()) else { 
+            warn!("[Auth] PoW validation failed: Missing seed");
+            return false; 
+        };
+        let Some(nonce) = obj.get("nonce").and_then(|n| n.as_str().map(|s| s.to_string())) else { 
+            warn!("[Auth] PoW validation failed: Missing nonce");
+            return false; 
+        };
 
-        if !self.redis.consume_challenge(seed).await.unwrap_or(false) { return false; }
+        if !self.redis.consume_challenge(seed).await.unwrap_or(false) { 
+            warn!("[Auth] PoW validation failed: Challenge already consumed or expired (seed={})", seed);
+            return false; 
+        }
         let x_bytes = hex::decode(seed).unwrap_or_default();
 
         if !PoWVerifier::validate_vdf(seed, &nonce, target_difficulty, &self.config.vdf_modulus, &self.config.vdf_phi) {
+            warn!("[Auth] PoW validation failed: VDF invalid (seed={}, target_diff={})", seed, target_difficulty);
             return false;
         }
 
-        let Some(sig_str) = obj.get("signature").and_then(|s| s.as_str()) else { return false; };
-        let Some(pk_str) = obj.get("public_key").or_else(|| obj.get("identityKey")).and_then(|k| k.as_str()) else { return false; };
+        let Some(sig_str) = obj.get("signature").and_then(|s| s.as_str()) else { 
+            warn!("[Auth] PoW validation failed: Missing signature");
+            return false; 
+        };
+        let Some(pk_str) = obj.get("public_key").or_else(|| obj.get("identityKey")).and_then(|k| k.as_str()) else { 
+            warn!("[Auth] PoW validation failed: Missing public key");
+            return false; 
+        };
 
-        let Ok(sig_bytes) = hex::decode(sig_str).or_else(|_| base64::engine::general_purpose::STANDARD.decode(sig_str)) else { return false; };
+        let Ok(sig_bytes) = hex::decode(sig_str).or_else(|_| base64::engine::general_purpose::STANDARD.decode(sig_str)) else { 
+            warn!("[Auth] PoW validation failed: Invalid signature encoding");
+            return false; 
+        };
         let mut pk_bytes = hex::decode(pk_str).or_else(|_| base64::engine::general_purpose::STANDARD.decode(pk_str)).unwrap_or_default();
         if pk_bytes.len() == 33 && pk_bytes[0] == 0x05 { pk_bytes.remove(0); }
 
         if !InputValidator::verify_xeddsa(&pk_bytes, &x_bytes, &sig_bytes) && !InputValidator::verify_ed25519(&pk_bytes, &x_bytes, &sig_bytes) {
+            warn!("[Auth] Signature verification failed (tried XEdDSA and raw Ed25519) for pk={}", pk_str);
             return false;
         }
 
-        if !InputValidator::verify_id_hash(context, &pk_bytes) { return false; }
+        if !InputValidator::verify_id_hash(context, &pk_bytes) { 
+            warn!("[Auth] PoW validation failed: Identity hash mismatch (context={}, pk={})", context, pk_str);
+            return false; 
+        }
+        
         true
     }
 
@@ -105,6 +130,7 @@ impl IdentityHandler {
         let mut hasher = Sha256::new();
         hasher.update(&pubkey_bytes);
         if hex::encode(hasher.finalize()) != id_hash {
+             warn!("[Identity] Keys upload failed: Identity mismatch (id_hash={})", id_hash);
              response["error"] = json!("Identity mismatch");
              return response;
         }
@@ -112,6 +138,7 @@ impl IdentityHandler {
         let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };
         if !InputValidator::verify_xeddsa(&pubkey_bytes, id_hash.as_bytes(), &sig_bytes) && 
            !InputValidator::verify_ed25519(&pubkey_bytes, id_hash.as_bytes(), &sig_bytes) {
+               warn!("[Identity] Keys upload failed: Ownership proof failed (id_hash={})", id_hash);
                response["error"] = json!("Ownership proof failed");
                return response;
         }
@@ -216,11 +243,13 @@ impl IdentityHandler {
 
         let payload = format!("NICKNAME_REGISTER:{}", raw_nick);
         if !InputValidator::verify_id_hash(id_hash, &pk_bytes) {
+            warn!("[Nickname] Identity mismatch for registration: id={} pk={}", id_hash, pk_val);
             return json!({"type": "error", "error": "Identity mismatch: Public key does not match hash"});
         }
         
         if !InputValidator::verify_xeddsa(&pk_bytes, payload.as_bytes(), &sig_bytes) && 
            !InputValidator::verify_ed25519(&pk_bytes, payload.as_bytes(), &sig_bytes) {
+               warn!("[Nickname] Ownership proof failed for registration: id={}", id_hash);
                return json!({"type": "error", "error": "Ownership proof failed"});
         }
 

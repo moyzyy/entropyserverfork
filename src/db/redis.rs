@@ -1,4 +1,5 @@
 use redis::AsyncCommands;
+use serde_json::json;
 use std::sync::Arc;
 use crate::config::ServerConfig;
 use anyhow::Result;
@@ -43,6 +44,28 @@ impl RedisManager {
         let mut conn = self.connection.clone();
         let res: Result<String, _> = redis::cmd("PING").query_async(&mut conn).await;
         res.is_ok()
+    }
+
+    pub async fn get_deep_stats(&self) -> Result<serde_json::Value> {
+        let mut conn = self.connection.clone();
+        
+        // Fetch DB size (total keys)
+        let dbsize: u64 = redis::cmd("DBSIZE").query_async(&mut conn).await.unwrap_or(0);
+        
+        // Fetch Memory Info
+        let info_mem: String = redis::cmd("INFO").arg("memory").query_async(&mut conn).await.unwrap_or_default();
+        let mut used_mem = "unknown".to_string();
+        for line in info_mem.lines() {
+            if line.starts_with("used_memory_human:") {
+                used_mem = line.split(':').nth(1).unwrap_or("unknown").to_string();
+                break;
+            }
+        }
+
+        Ok(serde_json::to_value(json!({
+            "total_keys": dbsize,
+            "memory_usage_human": used_mem,
+        }))?)
     }
 
 

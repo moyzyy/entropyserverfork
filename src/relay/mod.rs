@@ -10,6 +10,7 @@ pub struct MessageRelay {
     registry: Arc<Registry>,
     redis: Arc<RedisManager>,
     config: Arc<ServerConfig>,
+    metrics: Arc<Metrics>,
 }
 
 
@@ -24,12 +25,14 @@ impl MessageRelay {
         registry: Arc<Registry>,
         redis: Arc<RedisManager>,
         config: Arc<ServerConfig>,
-        _metrics: Arc<Metrics>,
+        metrics: Arc<Metrics>,
     ) -> Self {
-        Self { registry, redis, config }
+        Self { registry, redis, config, metrics }
     }
 
     pub async fn relay_binary(&self, target_hash: &str, data: &[u8], sender_hash: &str) {
+        self.metrics.increment_counter("relay_messages_total", 1.0);
+        self.metrics.increment_counter("relay_bytes_total", data.len() as f64);
         if data.len() + sender_hash.len() > self.config.max_message_size { return; }
         if data.is_empty() { return; }
 
@@ -117,6 +120,8 @@ impl MessageRelay {
     }
 
     pub async fn relay_volatile(&self, target_hash: &str, data: &[u8], sender_hash: &str) {
+        self.metrics.increment_counter("relay_messages_total", 1.0);
+        self.metrics.increment_counter("relay_bytes_total", data.len() as f64);
         let mut payload = Vec::with_capacity(64 + data.len());
         let sender_padded = format!("{: <64}", sender_hash);
         payload.extend_from_slice(sender_padded.as_bytes());

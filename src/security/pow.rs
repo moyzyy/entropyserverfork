@@ -6,8 +6,8 @@ pub struct PoWVerifier;
 impl PoWVerifier {
     pub fn get_required_difficulty(base: i32, active_connections: usize, penalty_multiplier: u32, max_diff: u32) -> u32 {
         let mut diff_base = base as usize;
-        if active_connections > 10000 { diff_base *= 20; }
-        else if active_connections > 5000 { diff_base *= 10; }
+        if active_connections > 10000 { diff_base *= 10; }
+        else if active_connections > 5000 { diff_base *= 6; }
         else if active_connections > 1000 { diff_base *= 4; }
         else if active_connections > 500 { diff_base *= 2; }
         
