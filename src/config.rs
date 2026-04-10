@@ -18,8 +18,6 @@ pub struct ServerConfig {
     pub offline_ttl_sec: u64,
     
     // Rate Limiting
-    pub rate_limit_per_sec: f64,
-    pub rate_limit_burst: usize,
     pub relay_window_sec: i64,
     pub keys_window_sec: i64,
     
@@ -54,7 +52,6 @@ pub struct ServerConfig {
     pub violation_reset_sec: u64,
     pub registration_intensity_low: u32,
     pub registration_intensity_high: u32,
-    pub identity_violation_threshold: u64,
     pub violation_jail_threshold: u32,
 }
 
@@ -81,8 +78,6 @@ impl ServerConfig {
             offline_ttl_sec: env::var("ENTROPY_OFFLINE_TTL").unwrap_or_else(|_| "86400".to_string()).parse().expect("Invalid TTL"),
             jail_duration_sec: env::var("ENTROPY_JAIL_TTL").unwrap_or_else(|_| "300".to_string()).parse().expect("Invalid Jail TTL"),
             violation_reset_sec: env::var("ENTROPY_VIOL_RESET").unwrap_or_else(|_| "3600".to_string()).parse().expect("Invalid Viol Reset TTL"),
-            rate_limit_per_sec: env::var("ENTROPY_RATE_LIMIT").expect("ENTROPY_RATE_LIMIT missing").parse().expect("Invalid rate"),
-            rate_limit_burst: env::var("ENTROPY_RATE_BURST").expect("ENTROPY_RATE_BURST missing").parse().expect("Invalid burst"),
             relay_window_sec: env::var("ENTROPY_RELAY_WINDOW").unwrap_or_else(|_| "60".to_string()).parse().expect("Invalid window"),
             keys_window_sec: env::var("ENTROPY_KEYS_WINDOW").unwrap_or_else(|_| "3600".to_string()).parse().expect("Invalid window"),
             pow_base_difficulty: env::var("ENTROPY_POW_BASE").expect("ENTROPY_POW_BASE missing").parse().expect("Invalid difficulty"),
@@ -106,7 +101,6 @@ impl ServerConfig {
             vdf_phi: env::var("ENTROPY_VDF_PHI").expect("ENTROPY_VDF_PHI missing"),
             registration_intensity_low: env::var("ENTROPY_INTENSITY_LOW").unwrap_or_else(|_| "10".to_string()).parse().expect("Invalid intensity"),
             registration_intensity_high: env::var("ENTROPY_INTENSITY_HIGH").unwrap_or_else(|_| "50".to_string()).parse().expect("Invalid intensity"),
-            identity_violation_threshold: env::var("ENTROPY_VIOL_LIMIT").unwrap_or_else(|_| "3".to_string()).parse().expect("Invalid violation limit"),
             violation_jail_threshold: env::var("ENTROPY_VIOL_THRESHOLD").unwrap_or_else(|_| "5".to_string()).parse().expect("Invalid threshold"),
         }
     }
@@ -126,8 +120,6 @@ impl ServerConfig {
             offline_ttl_sec: 86400,
             jail_duration_sec: 300,
             violation_reset_sec: 3600,
-            rate_limit_per_sec: 10.0,
-            rate_limit_burst: 20,
             relay_window_sec: 60,
             keys_window_sec: 3600,
             pow_base_difficulty: 10,
@@ -149,7 +141,6 @@ impl ServerConfig {
             vdf_phi: "1234567890".to_string(),
             registration_intensity_low: 10,
             registration_intensity_high: 50,
-            identity_violation_threshold: 3,
             violation_jail_threshold: 5,
         }
     }
