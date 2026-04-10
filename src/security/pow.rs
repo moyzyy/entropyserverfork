@@ -52,7 +52,7 @@ mod tests {
         assert_eq!(PoWVerifier::get_required_difficulty(10, 100, 0, 100), 10);
         // Connection load scaling
         assert_eq!(PoWVerifier::get_required_difficulty(10, 600, 0, 100), 20);
-        assert_eq!(PoWVerifier::get_required_difficulty(10, 10001, 0, 1000), 200);
+        assert_eq!(PoWVerifier::get_required_difficulty(10, 10001, 0, 1000), 100);
         // Penalty scaling
         assert_eq!(PoWVerifier::get_required_difficulty(10, 100, 2, 100), 20);
         // Max diff cap

@@ -1,33 +1,27 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::info;
 use entropy_rs::config::ServerConfig;
 use entropy_rs::db::redis::RedisManager;
+use entropy_rs::telemetry::metrics::Metrics;
 use entropy_rs::app;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
 
     let config = Arc::new(ServerConfig::load());
-    let redis = RedisManager::new(config.clone()).await?;
+    let metrics = Metrics::new();
+    let redis = RedisManager::new(config.clone(), metrics.clone()).await?;
     
-    let app = app(config.clone(), redis.clone()).await?;
+    let app = app(config.clone(), redis.clone(), metrics.clone()).await?;
 
     let addr: SocketAddr = format!("{}:{}", config.address, config.port).parse().expect("Invalid address");
-    info!("Entropy Server v0.1.0 starting on {}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await?;
     
-    axum::serve(listener, app.into_make_service())
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    
-    info!("Entropy Server shut down gracefully");
     Ok(())
 }
 

@@ -3,20 +3,21 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use entropy_rs::relay::QueuedMessage;
 
-async fn setup() -> (Arc<ServerConfig>, Arc<RedisManager>, Arc<Registry>, Arc<MessageRelay>) {
+async fn setup() -> (Arc<ServerConfig>, Arc<RedisManager>, Arc<Registry>, Arc<MessageRelay>, Arc<Metrics>) {
     let mut config = ServerConfig::test_default();
     config.max_offline_messages = 3;
     config.max_offline_messages_per_sender = 2;
     let config = Arc::new(config);
-    let redis = RedisManager::new(config.clone()).await.unwrap();
+    let metrics = Metrics::new();
+    let redis = RedisManager::new(config.clone(), metrics.clone()).await.unwrap();
     let registry = Arc::new(Registry::new());
-    let relay = Arc::new(MessageRelay::new(registry.clone(), redis.clone(), config.clone(), Metrics::new()));
-    (config, redis, registry, relay)
+    let relay = Arc::new(MessageRelay::new(registry.clone(), redis.clone(), config.clone(), metrics.clone()));
+    (config, redis, registry, relay, metrics)
 }
 
 #[tokio::test]
 async fn test_mailbox_quota_enforcement() {
-    let (_config, redis, registry, relay) = setup().await;
+    let (_config, redis, registry, relay, _metrics) = setup().await;
     let recipient = "victim";
     let sender = "spammer";
     let _ = redis.nuclear_burn(recipient).await;
@@ -37,7 +38,7 @@ async fn test_mailbox_quota_enforcement() {
 
 #[tokio::test]
 async fn test_protocol_multitasking_interleaved_fragments() {
-    let (_config, redis, registry, relay) = setup().await;
+    let (_config, redis, registry, relay, _metrics) = setup().await;
     let target = "target";
     let _ = redis.nuclear_burn(target).await;
     

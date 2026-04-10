@@ -1,20 +1,21 @@
-use entropy_rs::{config::ServerConfig, db::redis::RedisManager, handlers::identity::IdentityHandler, server::registry::Registry};
+use entropy_rs::{config::ServerConfig, db::redis::RedisManager, handlers::identity::IdentityHandler, server::registry::Registry, telemetry::metrics::Metrics};
 use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use ed25519_dalek::{SigningKey, Signer};
 use serde_json::json;
 
-async fn setup() -> (Arc<ServerConfig>, Arc<RedisManager>, IdentityHandler) {
+async fn setup() -> (Arc<ServerConfig>, Arc<RedisManager>, IdentityHandler, Arc<Metrics>) {
     let config = Arc::new(ServerConfig::test_default());
-    let redis = RedisManager::new(config.clone()).await.unwrap();
+    let metrics = Metrics::new();
+    let redis = RedisManager::new(config.clone(), metrics.clone()).await.unwrap();
     let registry = Arc::new(Registry::new());
     let handler = IdentityHandler::new(redis.clone(), registry, config.clone());
-    (config, redis, handler)
+    (config, redis, handler, metrics)
 }
 
 #[tokio::test]
 async fn test_race_nickname_simultaneous_registration() {
-    let (_config, _redis, handler) = setup().await;
+    let (_config, _redis, handler, _metrics) = setup().await;
     let nickname = format!("race_nick_{}", rand::random::<u32>());
     let handler = Arc::new(handler);
     
@@ -49,7 +50,7 @@ async fn test_race_nickname_simultaneous_registration() {
 
 #[tokio::test]
 async fn test_governance_identity_mismatch_rejection() {
-    let (_config, _redis, handler) = setup().await;
+    let (_config, _redis, handler, _metrics) = setup().await;
     // Public key X does not match Identity Hash Y
     let res = handler.handle_nickname_register(&json!({
         "nickname": "liar",

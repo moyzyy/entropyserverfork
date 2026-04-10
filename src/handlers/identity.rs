@@ -8,7 +8,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::{thread_rng, Rng};
 use hex;
 use sha2::{Sha256, Digest};
-use tracing::warn;
 use crate::config::ServerConfig;
 
 pub struct IdentityHandler {
@@ -52,48 +51,39 @@ impl IdentityHandler {
 
     pub async fn validate_pow(&self, obj: &Value, context: &str, target_difficulty: u32) -> bool {
         let Some(seed) = obj.get("seed").and_then(|s| s.as_str()) else { 
-            warn!("[Auth] PoW validation failed: Missing seed");
             return false; 
         };
         let Some(nonce) = obj.get("nonce").and_then(|n| n.as_str().map(|s| s.to_string())) else { 
-            warn!("[Auth] PoW validation failed: Missing nonce");
             return false; 
         };
 
         if !self.redis.consume_challenge(seed).await.unwrap_or(false) { 
-            warn!("[Auth] PoW validation failed: Challenge already consumed or expired (seed={})", seed);
             return false; 
         }
         let x_bytes = hex::decode(seed).unwrap_or_default();
 
         if !PoWVerifier::validate_vdf(seed, &nonce, target_difficulty, &self.config.vdf_modulus, &self.config.vdf_phi) {
-            warn!("[Auth] PoW validation failed: VDF invalid (seed={}, target_diff={})", seed, target_difficulty);
             return false;
         }
 
         let Some(sig_str) = obj.get("signature").and_then(|s| s.as_str()) else { 
-            warn!("[Auth] PoW validation failed: Missing signature");
             return false; 
         };
         let Some(pk_str) = obj.get("public_key").or_else(|| obj.get("identityKey")).and_then(|k| k.as_str()) else { 
-            warn!("[Auth] PoW validation failed: Missing public key");
             return false; 
         };
 
         let Ok(sig_bytes) = hex::decode(sig_str).or_else(|_| base64::engine::general_purpose::STANDARD.decode(sig_str)) else { 
-            warn!("[Auth] PoW validation failed: Invalid signature encoding");
             return false; 
         };
         let mut pk_bytes = hex::decode(pk_str).or_else(|_| base64::engine::general_purpose::STANDARD.decode(pk_str)).unwrap_or_default();
         if pk_bytes.len() == 33 && pk_bytes[0] == 0x05 { pk_bytes.remove(0); }
 
         if !InputValidator::verify_xeddsa(&pk_bytes, &x_bytes, &sig_bytes) && !InputValidator::verify_ed25519(&pk_bytes, &x_bytes, &sig_bytes) {
-            warn!("[Auth] Signature verification failed (tried XEdDSA and raw Ed25519) for pk={}", pk_str);
             return false;
         }
 
         if !InputValidator::verify_id_hash(context, &pk_bytes) { 
-            warn!("[Auth] PoW validation failed: Identity hash mismatch (context={}, pk={})", context, pk_str);
             return false; 
         }
         
@@ -130,7 +120,6 @@ impl IdentityHandler {
         let mut hasher = Sha256::new();
         hasher.update(&pubkey_bytes);
         if hex::encode(hasher.finalize()) != id_hash {
-             warn!("[Identity] Keys upload failed: Identity mismatch (id_hash={})", id_hash);
              response["error"] = json!("Identity mismatch");
              return response;
         }
@@ -138,7 +127,6 @@ impl IdentityHandler {
         let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };
         if !InputValidator::verify_xeddsa(&pubkey_bytes, id_hash.as_bytes(), &sig_bytes) && 
            !InputValidator::verify_ed25519(&pubkey_bytes, id_hash.as_bytes(), &sig_bytes) {
-               warn!("[Identity] Keys upload failed: Ownership proof failed (id_hash={})", id_hash);
                response["error"] = json!("Ownership proof failed");
                return response;
         }
@@ -183,8 +171,12 @@ impl IdentityHandler {
         let mut res = json!({ "type": "fetch_key_res" });
         if let Some(rid) = req.get("req_id") { res.as_object_mut().unwrap().insert("req_id".to_string(), rid.clone()); }
 
-        if let Ok(limit_res) = self.redis.check_rate_limit(&format!("limit:keys_f:uid:{}", initiator_hash), self.config.key_fetch_limit.into(), self.config.keys_window_sec, 1).await {
-            if !limit_res.allowed { return json!({"type": "error", "error": "Key fetch rate limit exceeded"}); }
+        let blinded_initiator = self.redis.blind_key("uid", initiator_hash);
+        if let Ok(limit_res) = self.redis.check_rate_limit(&format!("limit:keys_f:{}", blinded_initiator), self.config.key_fetch_limit.into(), self.config.keys_window_sec, 1).await {
+            if !limit_res.allowed { 
+               let msg = if limit_res.is_jailed { "Key fetch Jailed" } else { "Key fetch rate limit exceeded" };
+               return json!({"type": "error", "error": msg, "retry_after": limit_res.reset_after_sec}); 
+            }
         }
 
         if let Ok(Some(bundle_str)) = self.redis.get_user_bundle(target).await {
@@ -232,8 +224,14 @@ impl IdentityHandler {
 
         // Enforced at WebSocket layer
 
-        if let Ok(res) = self.redis.check_rate_limit(&format!("limit:nick:reg:{}", id_hash), self.config.nick_register_limit.into(), 3600, 1).await {
-            if !res.allowed { response["error"] = json!("Rate limit exceeded"); return response; }
+        let blinded_id = self.redis.blind_key("uid", id_hash);
+        if let Ok(res) = self.redis.check_rate_limit(&format!("limit:nick:reg:{}", blinded_id), self.config.nick_register_limit.into(), 3600, 1).await {
+            if !res.allowed { 
+                let msg = if res.is_jailed { "Nickname Register Jailed" } else { "Rate limit exceeded" };
+                response["error"] = json!(msg); 
+                response["retry_after"] = json!(res.reset_after_sec);
+                return response; 
+            }
         }
 
         let Some(sig_str) = req.get("signature").and_then(|s| s.as_str()) else { return response; };
@@ -243,13 +241,11 @@ impl IdentityHandler {
 
         let payload = format!("NICKNAME_REGISTER:{}", raw_nick);
         if !InputValidator::verify_id_hash(id_hash, &pk_bytes) {
-            warn!("[Nickname] Identity mismatch for registration: id={} pk={}", id_hash, pk_val);
             return json!({"type": "error", "error": "Identity mismatch: Public key does not match hash"});
         }
         
         if !InputValidator::verify_xeddsa(&pk_bytes, payload.as_bytes(), &sig_bytes) && 
            !InputValidator::verify_ed25519(&pk_bytes, payload.as_bytes(), &sig_bytes) {
-               warn!("[Nickname] Ownership proof failed for registration: id={}", id_hash);
                return json!({"type": "error", "error": "Ownership proof failed"});
         }
 
@@ -272,8 +268,12 @@ impl IdentityHandler {
             return json!({"type": "error", "error": "Public key required"});
         };
 
-        if let Ok(res) = self.redis.check_rate_limit(&format!("limit:lookup:uid:{}", initiator_hash), self.config.lookup_limit.into(), self.config.relay_window_sec, 1).await {
-            if !res.allowed { return json!({"type": "error", "error": "Lookup rate limit exceeded"}); }
+        let blinded_initiator = self.redis.blind_key("uid", initiator_hash);
+        if let Ok(res) = self.redis.check_rate_limit(&format!("limit:lookup:{}", blinded_initiator), self.config.lookup_limit.into(), self.config.relay_window_sec, 1).await {
+            if !res.allowed { 
+                let msg = if res.is_jailed { "Lookup Jailed" } else { "Lookup rate limit exceeded" };
+                return json!({"type": "error", "error": msg, "retry_after": res.reset_after_sec}); 
+            }
         }
 
         // Verify the requester is who they say they are
@@ -304,9 +304,13 @@ impl IdentityHandler {
             return json!({"type": "error", "error": "Public key required"});
         };
 
+        let blinded_initiator = self.redis.blind_key("uid", initiator_hash);
         // Strictly rate limit resolution per identity
-        if let Ok(res) = self.redis.check_rate_limit(&format!("limit:resolve:uid:{}", initiator_hash), self.config.lookup_limit.into(), self.config.relay_window_sec, 1).await {
-            if !res.allowed { return json!({"type": "error", "error": "Resolution rate limit exceeded"}); }
+        if let Ok(res) = self.redis.check_rate_limit(&format!("limit:resolve:{}", blinded_initiator), self.config.lookup_limit.into(), self.config.relay_window_sec, 1).await {
+            if !res.allowed { 
+                let msg = if res.is_jailed { "Resolution Jailed" } else { "Resolution rate limit exceeded" };
+                return json!({"type": "error", "error": msg, "retry_after": res.reset_after_sec}); 
+            }
         }
 
         let sig_bytes = if sig_str.len() == 128 { hex::decode(sig_str).unwrap_or_default() } else { BASE64.decode(sig_str).unwrap_or_default() };

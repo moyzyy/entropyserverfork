@@ -1,19 +1,20 @@
-use entropy_rs::{app, config::ServerConfig, db::redis::RedisManager, server::registry::Registry};
+use entropy_rs::{app, config::ServerConfig, db::redis::RedisManager, server::registry::Registry, telemetry::metrics::Metrics};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use entropy_rs::relay::QueuedMessage;
 
-async fn setup() -> (Arc<ServerConfig>, Arc<RedisManager>, Arc<Registry>) {
+async fn setup() -> (Arc<ServerConfig>, Arc<RedisManager>, Arc<Registry>, Arc<Metrics>) {
     let config = Arc::new(ServerConfig::test_default());
-    let redis = RedisManager::new(config.clone()).await.unwrap();
+    let metrics = Metrics::new();
+    let redis = RedisManager::new(config.clone(), metrics.clone()).await.unwrap();
     let registry = Arc::new(Registry::new());
-    (config, redis, registry)
+    (config, redis, registry, metrics)
 }
 
 #[tokio::test]
 async fn test_infra_health_and_stats() {
-    let (config, redis, _registry) = setup().await;
-    let router = app(config.clone(), redis.clone()).await.unwrap();
+    let (config, redis, _registry, metrics) = setup().await;
+    let router = app(config.clone(), redis.clone(), metrics.clone()).await.unwrap();
     
     use tower::ServiceExt;
     use axum::http::{Request, StatusCode};
@@ -29,7 +30,7 @@ async fn test_infra_health_and_stats() {
 
 #[tokio::test]
 async fn test_infra_registry_displacement() {
-    let (_config, _redis, registry) = setup().await;
+    let (_config, _redis, registry, _metrics) = setup().await;
     let user = "consistent_id";
     
     let (tx1, _rx1) = mpsc::unbounded_channel::<QueuedMessage>();

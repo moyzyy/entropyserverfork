@@ -1,16 +1,18 @@
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
+    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State, ConnectInfo},
     response::IntoResponse,
+    http::HeaderMap,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use crate::AppState;
 use futures_util::{StreamExt, SinkExt};
 use serde_json::{json, Value};
 use tokio::time::Duration;
 use rand::{thread_rng, Rng};
+use sha2::{Sha256, Digest};
 use crate::security::noise::TrafficNormalizer;
 use crate::security::validator::InputValidator;
-use tracing::warn;
 use crate::relay::QueuedMessage;
 use std::collections::HashMap;
 
@@ -29,9 +31,24 @@ enum CommandResult {
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
 ) -> impl IntoResponse {
+    let raw_ip = connect_info.map(|ConnectInfo(addr)| addr.ip().to_string()).unwrap_or_else(|| "127.0.0.1".to_string());
+    let real_ip = headers.get("cf-connecting-ip")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            headers.get("x-forwarded-for")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.split(',').next_back()) // Get last IP (the one added by our proxy)
+                .map(|s| s.trim().to_string())
+                .unwrap_or(raw_ip)
+        });
+
     ws.max_message_size(state.config.max_message_size)
-      .on_upgrade(move |socket| handle_socket(socket, state))
+      .on_upgrade(move |socket| handle_socket(socket, state, real_ip))
 }
 
 struct ConnectionGuard {
@@ -43,7 +60,7 @@ struct ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.state.registry.dec_total(); // Tracking for all connections
+        self.state.registry.dec_total();
         if self.authenticated {
             self.state.metrics.decrement_gauge("active_connections", 1.0);
         }
@@ -53,7 +70,7 @@ impl Drop for ConnectionGuard {
     }
 }
 
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>, client_ip: String) {
     state.registry.inc_total();
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<QueuedMessage>();
@@ -92,6 +109,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             }
             _ = handshake_check_timer.tick() => {
                 if !guard.authenticated && last_activity.elapsed() > Duration::from_secs(state.config.handshake_timeout_sec) {
+                    state.metrics.increment_counter("handshake_timeouts_total", 1.0);
                     break 'outer;
                 }
             }
@@ -113,7 +131,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     Message::Text(text) => {
                         let frame_size = text.len();
                         if frame_size != state.config.pacing.packet_size {
-                            tracing::warn!("[Security] Stealth Violation: Received Non-Standard Text Frame (size={})", frame_size);
                             if let Some(ref id_hash) = guard.identity_hash {
                                 let _ = state.redis.penalize_uid(id_hash, state.config.jail_duration_sec).await;
                             }
@@ -121,11 +138,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
 
                         if !InputValidator::pre_scan_depth(&text, state.config.max_json_depth) {
-                            tracing::warn!("[Security] JSON Depth violation (Pre-Scan/Text) - Dropping Frame");
                             continue;
                         }
                         let Ok(val) = serde_json::from_str::<Value>(&text) else { continue; };
-                        match process_command(val, &state, &mut guard, &tx, &mut _challenge_solved).await {
+                        match process_command(val, &state, &mut guard, &tx, &mut _challenge_solved, &client_ip).await {
                             CommandResult::Continue => {},
                             CommandResult::Close => break 'outer,
                             CommandResult::ErrorAndClose(err_val) => {
@@ -155,7 +171,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         }
 
                         if data.len() < 81 {
-                            tracing::warn!("[Security] Binary frame too short ({}) - Dropping", data.len());
                             continue;
                         }
 
@@ -165,7 +180,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         let len = u32::from_be_bytes(data[77..81].try_into().unwrap());
                         
                         if data.len() < (81 + len as usize) { 
-                            tracing::warn!("[Security] Buffer/Spec mismatch (len field {} > capacity {}) - Dropping Frame", len, data.len().saturating_sub(81));
                             continue;
                         }
 
@@ -174,7 +188,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
                         if is_control {
                             let max_chunks = (state.config.max_message_size as f32 / 1300.0).ceil() as u32;
-                            if total > max_chunks { tracing::warn!("[Security] Dropped Oversized Command (total={} > max={})", total, max_chunks); continue; }
+                            if total > max_chunks { continue; }
                             let entry = control_assembler.entry(transfer_id).or_insert_with(|| FragmentBuffer {
                                 total, chunks: HashMap::new(), last_activity: tokio::time::Instant::now(),
                             });
@@ -187,11 +201,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 control_assembler.remove(&transfer_id);
                                 if let Ok(cmd_text) = String::from_utf8(full_data) {
                                     if !InputValidator::pre_scan_depth(&cmd_text, state.config.max_json_depth) {
-                                        tracing::warn!("[Security] JSON Depth violation (Pre-Scan/Control) - Dropping Reassembly");
                                         continue;
                                     }
                                     if let Ok(val) = serde_json::from_str::<Value>(&cmd_text) {
-                                        match process_command(val, &state, &mut guard, &tx, &mut _challenge_solved).await {
+                                        match process_command(val, &state, &mut guard, &tx, &mut _challenge_solved, &client_ip).await {
                                             CommandResult::Continue => {},
                                             CommandResult::Close => break 'outer,
                                             CommandResult::ErrorAndClose(err_val) => {
@@ -209,17 +222,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             for &byte in target_bytes { if byte == 0 { break; } target.push(byte as char); }
                             let target_hash = target.trim();
                             if InputValidator::is_valid_hash(target_hash) {
+                                let blinded_uid = state.redis.blind_key("uid", uid_hash);
                                 let (sender_limit_key, sender_limit_size) = if b_type == 0x02 {
-                                    (format!("limit:media:uid:{}", uid_hash), state.config.media_limit.into())
+                                    (format!("limit:media:{}", blinded_uid), state.config.media_limit.into())
                                 } else {
-                                    (format!("limit:relay:uid:{}", uid_hash), state.config.relay_limit.into())
+                                    (format!("limit:relay:{}", blinded_uid), state.config.relay_limit.into())
                                 };
 
                                 if let Ok(res) = state.redis.check_rate_limit(&sender_limit_key, sender_limit_size, state.config.relay_window_sec, 1).await {
                                     if !res.allowed {
                                         if res.is_jailed { 
-                                            guard.jailed_until = Some(tokio::time::Instant::now() + Duration::from_secs(20));
-                                            let _ = tx.send(QueuedMessage { msg: Message::Text(json!({"type": "error", "error": "Identity Jailed"}).to_string()) });
+                                            guard.jailed_until = Some(tokio::time::Instant::now() + Duration::from_secs(state.config.jail_duration_sec));
+                                            let _ = tx.send(QueuedMessage { msg: Message::Text(json!({"type": "error", "error": "Identity Jailed", "retry_after": res.reset_after_sec}).to_string()) });
                                             break 'outer; 
                                         }
                                         let _ = tx.send(QueuedMessage { msg: Message::Text(json!({"type": "error", "error": "Rate limit exceeded"}).to_string()) });
@@ -233,8 +247,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     state.relay.relay_binary(target_hash, &data[64..], uid_hash).await; 
                                 }
                             }
-                        } else {
-                            tracing::warn!("[Security] Malicious Intent: Attempted binary relay before authentication");
                         }
                     }
                     Message::Close(_) => break,
@@ -251,10 +263,10 @@ async fn process_command(
     guard: &mut ConnectionGuard,
     tx: &tokio::sync::mpsc::UnboundedSender<QueuedMessage>,
     _challenge_solved: &mut bool,
+    client_ip: &str,
 ) -> CommandResult {
     let depth = InputValidator::get_json_depth(&val);
     if depth > state.config.max_json_depth { 
-        tracing::warn!("[Security] JSON Depth violation from authenticated identity - REJECTING"); 
         return CommandResult::Close; 
     }
 
@@ -274,6 +286,23 @@ async fn process_command(
     if !guard.authenticated && !["pow_challenge", "auth", "dummy_pacing"].contains(&msg_type) {
         return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Handshake required"}));
     }
+
+    match msg_type {
+        "pow_challenge" | "auth" => {
+            let mut hasher = Sha256::new();
+            hasher.update(client_ip.as_bytes());
+            let ip_hash = hex::encode(hasher.finalize());
+            let limit_key = format!("limit:ip:preauth:{}", ip_hash);
+            
+            if let Ok(res) = state.redis.check_rate_limit(&limit_key, 20, 60, 1).await {
+                if !res.allowed {
+                    return CommandResult::ErrorAndClose(json!({"type": "error", "error": "IP Rate limit exceeded. Try again in 60s."}));
+                }
+            }
+        }
+        _ => {}
+    }
+
     if let Some(ref uid) = guard.identity_hash {
         if let Some(until) = guard.jailed_until {
             if tokio::time::Instant::now() < until {
@@ -283,10 +312,11 @@ async fn process_command(
             }
         }
 
-        if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:uid:{}", uid), state.config.relay_limit.into(), state.config.relay_window_sec, 1).await {
+        let blinded_uid = state.redis.blind_key("uid", uid);
+        if let Ok(res) = state.redis.check_rate_limit(&format!("limit:relay:{}", blinded_uid), state.config.relay_limit.into(), state.config.relay_window_sec, 1).await {
             if res.is_jailed {
-                guard.jailed_until = Some(tokio::time::Instant::now() + Duration::from_secs(20));
-                return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Identity Jailed"}));
+                guard.jailed_until = Some(tokio::time::Instant::now() + Duration::from_secs(state.config.jail_duration_sec));
+                return CommandResult::ErrorAndClose(json!({"type": "error", "error": "Identity Jailed", "retry_after": res.reset_after_sec}));
             }
         }
     }
@@ -301,11 +331,9 @@ async fn process_command(
                 if let Some(token) = payload.get("session_token").and_then(|t| t.as_str()) {
                     if state.redis.verify_session_token(&id_hash_str, token).await.unwrap_or(false) { 
                         auth_valid = true; 
-                    } else {
-                        state.metrics.increment_counter("auth_failures_total", 1.0);
-                        warn!("[WS Auth] Session token verification failed for id={}", id_hash_str);
                     }
                 }
+
                 if !auth_valid {
                     let intensity = state.redis.get_registration_intensity().await.unwrap_or(0);
                     let mut penalty = 0; 
@@ -313,19 +341,10 @@ async fn process_command(
                     if intensity > state.config.registration_intensity_high as i32 { penalty = 4; }
                     
                     let req_diff = crate::security::pow::PoWVerifier::get_required_difficulty(state.config.pow_base_difficulty, state.registry.connection_count(), penalty, state.config.max_pow_difficulty as u32);
-                    if payload.get("signature").is_some() {
-                        if state.identity.validate_pow(payload, &id_hash_str, req_diff).await { 
-                            auth_valid = true; 
-                        } else {
-                            state.metrics.increment_counter("auth_failures_total", 1.0);
-                            warn!("[WS Auth] PoW/Signature verification failed for id={}", id_hash_str);
-                        }
-                    } else {
-                        warn!("[WS Auth] No signature provided in auth payload for id={}", id_hash_str);
+                    if payload.get("signature").is_some() && state.identity.validate_pow(payload, &id_hash_str, req_diff).await { 
+                        auth_valid = true; 
                     }
                 }
-            } else {
-                warn!("[WS Auth] Missing payload in auth message");
             }
 
             if auth_valid && !id_hash_str.is_empty() {
@@ -356,7 +375,6 @@ async fn process_command(
                 state.relay.deliver_pending(&id_hash_str, tx.clone()).await;
             } else {
                 state.metrics.increment_counter("auth_failures_total", 1.0);
-                warn!("[WS Auth] Authentication FAILED for id={}", id_hash_str);
                 let mut err_res = json!({"type": "error", "error": "Handshake failed", "code": "auth_failed"});
                 if let Some(rid) = req_id { err_res["req_id"] = rid; }
                 return CommandResult::ErrorAndClose(err_res);
@@ -364,7 +382,8 @@ async fn process_command(
         }
         "keys_upload" => {
             let limit_key = if let Some(ref uid) = guard.identity_hash {
-                format!("limit:keys_up:uid:{}", uid)
+                let blinded_uid = state.redis.blind_key("uid", uid);
+                format!("limit:keys_up:{}", blinded_uid)
             } else {
                 return CommandResult::Close; 
             };

@@ -33,7 +33,6 @@ USER entropy
 # Production Defaults (Overridden by Docker Compose)
 ENV ENTROPY_ADDR=0.0.0.0
 ENV ENTROPY_PORT=8080
-ENV RUST_LOG=info
 
 EXPOSE 8080
 

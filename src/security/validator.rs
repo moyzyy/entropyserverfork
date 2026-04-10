@@ -1,4 +1,3 @@
-use tracing::warn;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use sha2::{Sha256, Digest};
@@ -83,7 +82,6 @@ impl InputValidator {
             }
         }
 
-        warn!("[Security] All XEdDSA verification paths failed for pk={}", hex::encode(pk_bytes));
         false
     }
 
@@ -93,8 +91,6 @@ impl InputValidator {
             key_32.remove(0);
         }
         if key_32.len() != 32 { return false; }
-        
-        // Silent decoding for internal attempts
         let Ok(key) = VerifyingKey::from_bytes(key_32.as_slice().try_into().unwrap_or(&[0;32])) else { 
             return false; 
         };

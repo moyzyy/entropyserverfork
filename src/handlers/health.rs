@@ -105,21 +105,26 @@ impl HealthHandler {
             "traffic": {
                 "messages_relayed": self.metrics.get_counter("relay_messages_total") as i64,
                 "bytes_processed": self.metrics.get_counter("relay_bytes_total") as i64,
-                "avg_throughput_mps": self.metrics.get_counter("relay_messages_total") / (uptime as f64).max(1.0),
+                "offline_stored": self.metrics.get_counter("relay_offline_stored_total") as i64,
+                "mps": self.metrics.get_counter("relay_messages_total") / (uptime as f64).max(1.0),
             },
             "security": {
                 "auth_failures": self.metrics.get_counter("auth_failures_total") as i64,
+                "handshake_timeouts": self.metrics.get_counter("handshake_timeouts_total") as i64,
                 "global_rejections": self.metrics.get_counter("global_limit_rejected") as i64,
+                "jail_events_total": self.metrics.get_counter("jail_events_total") as i64,
+                "jail_population": self.redis.get_jail_count().await,
+                "active_defense_intensity": self.redis.get_registration_intensity().await.unwrap_or(0),
                 "jail_threshold": self.config.violation_jail_threshold,
             },
             "database": {
-                "redis_status": if self.redis.health_check().await { "up" } else { "down" },
-                "redis_keys_total": redis_stats.get("total_keys"),
-                "redis_memory": redis_stats.get("memory_usage_human"),
+                "status": if self.redis.health_check().await { "up" } else { "down" },
+                "errors_total": self.metrics.get_counter("redis_errors_total") as i64,
+                "keys_total": redis_stats.get("total_keys"),
+                "memory": redis_stats.get("memory_usage_human"),
             },
             "system": {
                 "os": System::name().unwrap_or_default(),
-                "kernel": System::kernel_version().unwrap_or_default(),
                 "cores": num_cpus::get(),
             }
         });

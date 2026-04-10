@@ -1,18 +1,19 @@
-use entropy_rs::{app, config::ServerConfig, db::redis::RedisManager, security::validator::InputValidator};
+use entropy_rs::{app, config::ServerConfig, db::redis::RedisManager, security::validator::InputValidator, telemetry::metrics::Metrics};
 use std::sync::Arc;
 use tokio_tungstenite::connect_async;
 use futures::StreamExt;
 use std::time::Duration;
 
-async fn setup() -> (Arc<ServerConfig>, Arc<RedisManager>) {
+async fn setup() -> (Arc<ServerConfig>, Arc<RedisManager>, Arc<Metrics>) {
     let config = Arc::new(ServerConfig::test_default());
-    let redis = RedisManager::new(config.clone()).await.unwrap();
-    (config, redis)
+    let metrics = Metrics::new();
+    let redis = RedisManager::new(config.clone(), metrics.clone()).await.unwrap();
+    (config, redis, metrics)
 }
 
 #[tokio::test]
 async fn test_vulnerability_binary_parsing_panics() {
-    let (_config, _redis, _registry, relay) = setup_relay().await;
+    let (_config, _redis, _registry, relay, _metrics) = setup_relay().await;
     // Regression: Ensure the server doesn't panic on under-sized binary frames
     relay.relay_binary("target", &[0x02], "sender").await;
     relay.relay_binary("target", &[0x02, 1, 2, 3], "sender").await;
@@ -28,9 +29,10 @@ async fn test_vulnerability_json_nesting_bomb() {
 
 #[tokio::test]
 async fn test_mechanic_jailing_escalation() {
-    let (_config, redis) = setup().await;
+    let (_config, redis, _metrics) = setup().await;
     let user_id = "test_jail_user";
-    let key = format!("limit:relay:uid:{}", user_id);
+    let b_uid = redis.blind_key("uid", user_id);
+    let key = format!("limit:relay:{}", b_uid);
     
     // Manually jail the user
     let _ = redis.penalize_uid(user_id, 300).await;
@@ -45,13 +47,14 @@ async fn test_handshake_slowloris_timeout() {
     let mut config = ServerConfig::test_default();
     config.handshake_timeout_sec = 1;
     let config = Arc::new(config);
-    let redis = RedisManager::new(config.clone()).await.unwrap();
+    let metrics = Metrics::new();
+    let redis = RedisManager::new(config.clone(), metrics.clone()).await.unwrap();
     
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let local_addr = listener.local_addr().unwrap();
     let server_handle = tokio::spawn(async move {
-        axum::serve(listener, app(config, redis).await.unwrap()).await.unwrap();
+        axum::serve(listener, app(config, redis, metrics).await.unwrap()).await.unwrap();
     });
     
     let ws_url = format!("ws://{}/ws", local_addr);
@@ -63,10 +66,11 @@ async fn test_handshake_slowloris_timeout() {
     server_handle.abort();
 }
 
-async fn setup_relay() -> (Arc<ServerConfig>, Arc<RedisManager>, Arc<entropy_rs::server::registry::Registry>, Arc<entropy_rs::relay::MessageRelay>) {
+async fn setup_relay() -> (Arc<ServerConfig>, Arc<RedisManager>, Arc<entropy_rs::server::registry::Registry>, Arc<entropy_rs::relay::MessageRelay>, Arc<Metrics>) {
     let config = Arc::new(ServerConfig::test_default());
-    let redis = RedisManager::new(config.clone()).await.unwrap();
+    let metrics = Metrics::new();
+    let redis = RedisManager::new(config.clone(), metrics.clone()).await.unwrap();
     let registry = Arc::new(entropy_rs::server::registry::Registry::new());
-    let relay = Arc::new(entropy_rs::relay::MessageRelay::new(registry.clone(), redis.clone(), config.clone(), entropy_rs::telemetry::metrics::Metrics::new()));
-    (config, redis, registry, relay)
+    let relay = Arc::new(entropy_rs::relay::MessageRelay::new(registry.clone(), redis.clone(), config.clone(), metrics.clone()));
+    (config, redis, registry, relay, metrics)
 }

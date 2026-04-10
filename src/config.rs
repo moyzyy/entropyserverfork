@@ -53,6 +53,7 @@ pub struct ServerConfig {
     pub registration_intensity_low: u32,
     pub registration_intensity_high: u32,
     pub violation_jail_threshold: u32,
+    pub database_salt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +103,7 @@ impl ServerConfig {
             registration_intensity_low: env::var("ENTROPY_INTENSITY_LOW").unwrap_or_else(|_| "10".to_string()).parse().expect("Invalid intensity"),
             registration_intensity_high: env::var("ENTROPY_INTENSITY_HIGH").unwrap_or_else(|_| "50".to_string()).parse().expect("Invalid intensity"),
             violation_jail_threshold: env::var("ENTROPY_VIOL_THRESHOLD").unwrap_or_else(|_| "5".to_string()).parse().expect("Invalid threshold"),
+            database_salt: env::var("ENTROPY_DATABASE_SALT").unwrap_or_else(|_| "default_secure_salt_change_me_in_prod!".to_string()),
         }
     }
 
@@ -142,6 +144,7 @@ impl ServerConfig {
             registration_intensity_low: 10,
             registration_intensity_high: 50,
             violation_jail_threshold: 5,
+            database_salt: "test_salt_1234567890".to_string(),
         }
     }
 }

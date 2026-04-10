@@ -8,6 +8,7 @@ use rand::{thread_rng, RngCore};
 use hex;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use crate::telemetry::metrics::Metrics;
 
 #[derive(Debug, Clone)]
 pub struct RateLimitResult {
@@ -21,18 +22,20 @@ pub struct RateLimitResult {
 pub struct RedisManager {
     connection: redis::aio::MultiplexedConnection,
     config: Arc<ServerConfig>,
+    metrics: Arc<Metrics>,
     cached_intensity: AtomicI32,
     last_intensity_check: AtomicU64,
 }
 
 impl RedisManager {
-    pub async fn new(config: Arc<ServerConfig>) -> Result<Arc<Self>> {
+    pub async fn new(config: Arc<ServerConfig>, metrics: Arc<Metrics>) -> Result<Arc<Self>> {
         let client = redis::Client::open(config.redis_url.clone())?;
         let connection = client.get_multiplexed_async_connection().await?;
         
         let manager = Arc::new(Self {
             connection,
             config: config.clone(),
+            metrics,
             cached_intensity: AtomicI32::new(0),
             last_intensity_check: AtomicU64::new(0),
         });
@@ -40,19 +43,51 @@ impl RedisManager {
         Ok(manager)
     }
 
+    pub fn blind_key(&self, prefix: &str, raw: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.config.database_salt.as_bytes());
+        hasher.update(raw.as_bytes());
+        format!("{}:{}", prefix, hex::encode(hasher.finalize()))
+    }
+
+    pub fn mask_value(&self, data: &str, context: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.config.database_salt.as_bytes());
+        hasher.update(context.as_bytes());
+        let pad = hasher.finalize();
+        let data_bytes = data.as_bytes();
+        let mut res = Vec::with_capacity(data_bytes.len());
+        for (i, b) in data_bytes.iter().enumerate() {
+            res.push(b ^ pad[i % pad.len()]);
+        }
+        hex::encode(res)
+    }
+
+    pub fn unmask_value(&self, data: &str, context: &str) -> Option<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(self.config.database_salt.as_bytes());
+        hasher.update(context.as_bytes());
+        let pad = hasher.finalize();
+        let data_bytes = hex::decode(data).ok()?;
+        let mut res = Vec::with_capacity(data_bytes.len());
+        for (i, b) in data_bytes.iter().enumerate() {
+            res.push(b ^ pad[i % pad.len()]);
+        }
+        String::from_utf8(res).ok()
+    }
+
     pub async fn health_check(&self) -> bool {
         let mut conn = self.connection.clone();
         let res: Result<String, _> = redis::cmd("PING").query_async(&mut conn).await;
+        if res.is_err() { self.metrics.increment_counter("redis_errors_total", 1.0); }
         res.is_ok()
     }
 
     pub async fn get_deep_stats(&self) -> Result<serde_json::Value> {
         let mut conn = self.connection.clone();
         
-        // Fetch DB size (total keys)
         let dbsize: u64 = redis::cmd("DBSIZE").query_async(&mut conn).await.unwrap_or(0);
         
-        // Fetch Memory Info
         let info_mem: String = redis::cmd("INFO").arg("memory").query_async(&mut conn).await.unwrap_or_default();
         let mut used_mem = "unknown".to_string();
         for line in info_mem.lines() {
@@ -109,7 +144,6 @@ impl RedisManager {
                 if viol == 1 then redis.call('EXPIRE', violation_key, period * 2) end
                 
                 if viol > violation_threshold then
-                    -- 🔐 NUCLEAR BAN: Set the global identity jail
                     redis.call('SETEX', jail_key, jail_duration, 'banned')
                     return {-1, 0, jail_duration}
                 end
@@ -178,12 +212,16 @@ impl RedisManager {
                     }
                 }
 
+                if status == -1 {
+                    self.metrics.increment_counter("jail_events_total", 1.0);
+                }
+
                 Ok(RateLimitResult {
                     allowed: false,
                     current,
                     limit,
                     reset_after_sec: val2,
-                    is_jailed: false,
+                    is_jailed: status == -1,
                 })
             }
         } else {
@@ -199,17 +237,45 @@ impl RedisManager {
 
     pub async fn penalize_uid(&self, user_hash: &str, duration_sec: u64) -> Result<()> {
         let mut conn = self.connection.clone();
-        let jail_key = format!("limit:relay:uid:{}:jail", user_hash);
+        let blinded_uid = self.blind_key("uid", user_hash);
+        let jail_key = format!("limit:relay:{}:jail", blinded_uid);
         let _: () = conn.set_ex(&jail_key, "banned", duration_sec).await?;
+        self.metrics.increment_counter("jail_events_total", 1.0);
         Ok(())
+    }
+
+    pub async fn get_jail_count(&self) -> u64 {
+        let mut conn = self.connection.clone();
+        let mut count = 0;
+        let mut cursor = 0;
+        loop {
+            let res: (u64, Vec<String>) = match redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg("limit:relay:uid:*:jail")
+                .arg("COUNT")
+                .arg(1000)
+                .query_async(&mut conn)
+                .await 
+            {
+                Ok(r) => r,
+                Err(_) => return 0,
+            };
+            cursor = res.0;
+            count += res.1.len() as u64;
+            if cursor == 0 { break; }
+        }
+        count
     }
 
 
     pub async fn store_offline_message(&self, recipient_hash: &str, sender_hash: &str, message: &[u8], limit: usize, sender_limit: usize) -> Result<bool> {
         let mut conn = self.connection.clone();
-        let key = format!("msg:{}", recipient_hash);
-        let sender_count_key = format!("offcnt:{}:{}", recipient_hash, sender_hash);
-        let sender_set_key = format!("offsenders:{}", recipient_hash);
+        let b_recipient = self.blind_key("uid", recipient_hash);
+        let b_sender = self.blind_key("uid", sender_hash);
+        let key = format!("msg:{}", b_recipient);
+        let sender_count_key = format!("offcnt:{}:{}", b_recipient, b_sender);
+        let sender_set_key = format!("offsenders:{}", b_recipient);
         
         let script = redis::Script::new(r"
             local msg_key = KEYS[1]
@@ -241,24 +307,29 @@ impl RedisManager {
             return 1
         ");
 
-        let _: () = script.key(key).key(sender_count_key).key(sender_set_key)
+        let res: Result<(), _> = script.key(key).key(sender_count_key).key(sender_set_key)
             .arg(message).arg(limit).arg(sender_limit).arg(self.config.offline_ttl_sec)
-            .invoke_async(&mut conn).await?;
+            .invoke_async(&mut conn).await;
+            
+        if res.is_err() { self.metrics.increment_counter("redis_errors_total", 1.0); }
+        res?;
             
         Ok(true)
     }
 
     pub async fn get_offline_count(&self, recipient_hash: &str) -> Result<u64> {
         let mut conn = self.connection.clone();
-        let key = format!("msg:{}", recipient_hash);
+        let b_recipient = self.blind_key("uid", recipient_hash);
+        let key = format!("msg:{}", b_recipient);
         let len: u64 = conn.llen(&key).await?;
         Ok(len)
     }
 
     pub async fn get_offline_messages(&self, recipient_hash: &str) -> Result<Vec<Vec<u8>>> {
         let mut conn = self.connection.clone();
-        let key = format!("msg:{}", recipient_hash);
-        let sender_set_key = format!("offsenders:{}", recipient_hash);
+        let b_recipient = self.blind_key("uid", recipient_hash);
+        let key = format!("msg:{}", b_recipient);
+        let sender_set_key = format!("offsenders:{}", b_recipient);
         
         let script = redis::Script::new(r"
             local msgs = redis.call('LRANGE', KEYS[1], 0, -1)
@@ -279,17 +350,23 @@ impl RedisManager {
 
     pub async fn store_user_bundle(&self, user_hash: &str, bundle_json: &str) -> Result<()> {
         let mut conn = self.connection.clone();
-        let key = format!("keys:{}", user_hash);
-        let _: () = conn.set_ex(&key, bundle_json, 2592000).await?;
-        let _: () = conn.sadd("active_users", user_hash).await?;
-        let _: () = conn.expire("active_users", 2592000).await?;
+        let key = self.blind_key("keys", user_hash);
+        let res: Result<()> = async {
+            let _: () = conn.set_ex(&key, bundle_json, 2592000).await?;
+            let _: () = conn.sadd("active_users", self.blind_key("uid", user_hash)).await?;
+            let _: () = conn.expire("active_users", 2592000).await?;
+            Ok(())
+        }.await;
+
+        if res.is_err() { self.metrics.increment_counter("redis_errors_total", 1.0); }
+        res?;
         self.mark_id_seen(user_hash).await?;
         Ok(())
     }
 
     pub async fn get_user_bundle(&self, user_hash: &str) -> Result<Option<String>> {
         let mut conn = self.connection.clone();
-        let key = format!("keys:{}", user_hash);
+        let key = self.blind_key("keys", user_hash);
         let val: Option<String> = conn.get(&key).await?;
         Ok(val)
     }
@@ -298,7 +375,7 @@ impl RedisManager {
         if keys.is_empty() { return Ok(()); }
         
         let mut conn = self.connection.clone();
-        let key = format!("otk:{}", user_hash);
+        let key = self.blind_key("otk", user_hash);
         
         let script = redis::Script::new(r#"
             local key = KEYS[1]
@@ -323,7 +400,7 @@ impl RedisManager {
         "#);
 
         let mut inv = script.key(&key);
-        inv.arg(self.config.max_prekeys_per_upload); // limit
+        inv.arg(self.config.max_prekeys_per_upload);
         for k in keys { inv.arg(k); }
         
         let _: u64 = inv.invoke_async(&mut conn).await?;
@@ -333,7 +410,7 @@ impl RedisManager {
     pub async fn store_kyber_otk_pool(&self, user_hash: &str, keys: Vec<String>) -> Result<()> {
         if keys.is_empty() { return Ok(()); }
         let mut conn = self.connection.clone();
-        let key = format!("kyber_otk:{}", user_hash);
+        let key = self.blind_key("kyber_otk", user_hash);
         let script = redis::Script::new(r#"
             local key = KEYS[1]
             local limit = tonumber(ARGV[1])
@@ -363,8 +440,8 @@ impl RedisManager {
 
     pub async fn pop_pqdh_otks(&self, user_hash: &str) -> Result<(Option<String>, Option<String>)> {
         let mut conn = self.connection.clone();
-        let otk_key = format!("otk:{}", user_hash);
-        let kyber_otk_key = format!("kyber_otk:{}", user_hash);
+        let otk_key = self.blind_key("otk", user_hash);
+        let kyber_otk_key = self.blind_key("kyber_otk", user_hash);
         
         let script = redis::Script::new(r"
             local otk = redis.call('SPOP', KEYS[1])
@@ -387,57 +464,62 @@ impl RedisManager {
 
     pub async fn pop_otk(&self, user_hash: &str) -> Result<Option<String>> {
         let mut conn = self.connection.clone();
-        let key = format!("otk:{}", user_hash);
+        let key = self.blind_key("otk", user_hash);
         let val: Option<String> = conn.spop(&key).await?;
         Ok(val)
     }
 
     pub async fn get_otk_count(&self, user_hash: &str) -> Result<u32> {
         let mut conn = self.connection.clone();
-        let key = format!("otk:{}", user_hash);
+        let key = self.blind_key("otk", user_hash);
         let count: u32 = conn.scard(&key).await?;
         Ok(count)
     }
 
     pub async fn register_nickname(&self, nickname: &str, user_hash: &str) -> Result<bool> {
         let mut conn = self.connection.clone();
-        let owner_key = format!("rn:{}", user_hash);
-        let existing_nick: Option<String> = conn.get(&owner_key).await?;
+        let owner_key = self.blind_key("rn", user_hash);
+        let existing_masked: Option<String> = conn.get(&owner_key).await?;
+        
+        let existing_nick = existing_masked.and_then(|m| self.unmask_value(&m, user_hash));
+        
         if let Some(ref old_name) = existing_nick {
             if old_name == nickname {
-                let _: () = conn.expire(format!("nick:{}", nickname), 2592000).await?;
+                let _: () = conn.expire(self.blind_key("nick", nickname), 2592000).await?;
                 let _: () = conn.expire(&owner_key, 2592000).await?;
                 return Ok(true);
             }
         }
-        let new_key = format!("nick:{}", nickname);
-        let success: bool = conn.set_nx(&new_key, user_hash).await?;
+        let new_key = self.blind_key("nick", nickname);
+        let masked_user = self.mask_value(user_hash, nickname);
+        let success: bool = conn.set_nx(&new_key, masked_user).await?;
         if !success { return Ok(false); }
         if let Some(old_name) = existing_nick {
-            let _: () = conn.del(format!("nick:{}", old_name)).await?;
+            let _: () = conn.del(self.blind_key("nick", &old_name)).await?;
         }
         let _: () = conn.expire(&new_key, 2592000).await?;
-        let _: () = conn.set_ex(&owner_key, nickname, 2592000).await?;
+        let masked_nick = self.mask_value(nickname, user_hash);
+        let _: () = conn.set_ex(&owner_key, masked_nick, 2592000).await?;
         Ok(true)
     }
 
     pub async fn resolve_nickname(&self, nickname: &str) -> Result<Option<String>> {
         let mut conn = self.connection.clone();
-        let key = format!("nick:{}", nickname);
+        let key = self.blind_key("nick", nickname);
         let val: Option<String> = conn.get(key).await?;
-        Ok(val)
+        Ok(val.and_then(|m| self.unmask_value(&m, nickname)))
     }
 
     pub async fn get_nickname(&self, user_hash: &str) -> Result<Option<String>> {
         let mut conn = self.connection.clone();
-        let owner_key = format!("rn:{}", user_hash);
+        let owner_key = self.blind_key("rn", user_hash);
         let nick: Option<String> = conn.get(&owner_key).await?;
-        Ok(nick)
+        Ok(nick.and_then(|m| self.unmask_value(&m, user_hash)))
     }
 
     pub async fn mark_id_seen(&self, user_hash: &str) -> Result<()> {
         let mut conn = self.connection.clone();
-        let key = format!("seen:{}", user_hash);
+        let key = self.blind_key("seen", user_hash);
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let _: () = conn.set_ex(&key, now, 2592000).await?;
         Ok(())
@@ -446,7 +528,8 @@ impl RedisManager {
 
     pub async fn get_identity_violations(&self, user_hash: &str) -> Result<u32> {
         let mut conn = self.connection.clone();
-        let key = format!("limit:relay:uid:{}:viol", user_hash);
+        let blinded_uid = self.blind_key("uid", user_hash);
+        let key = format!("limit:relay:{}:viol", blinded_uid);
         let res: Option<u32> = conn.get(&key).await?;
         Ok(res.unwrap_or(0))
     }
@@ -455,7 +538,6 @@ impl RedisManager {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let last_check = self.last_intensity_check.load(Ordering::Relaxed);
         
-        // Return cached value if it's less than 10 seconds old
         if now < last_check + 10 {
             return Ok(self.cached_intensity.load(Ordering::Relaxed));
         }
@@ -479,43 +561,57 @@ impl RedisManager {
 
     pub async fn nuclear_burn(&self, user_hash: &str) -> Result<bool> {
         let mut conn = self.connection.clone();
-        let script = r"
-            local id = ARGV[1]
-            local nick = redis.call('GET', 'rn:' .. id)
-            if nick then redis.call('DEL', 'nick:' .. nick) end
-            redis.call('DEL', 'rn:' .. id)
-            redis.call('DEL', 'keys:' .. id)
-            redis.call('DEL', 'msg:' .. id)
-            local senders = redis.call('SMEMBERS', 'offsenders:' .. id)
-            for _, sc_key in ipairs(senders) do
-                redis.call('DEL', sc_key)
-            end
-            redis.call('DEL', 'offsenders:' .. id)
-            
-            redis.call('DEL', 'sess:' .. id)
-            redis.call('DEL', 'seen:' .. id)
-            redis.call('DEL', 'otk:' .. id)
-            redis.call('DEL', 'limit:relay:uid:' .. id)
-            redis.call('DEL', 'limit:relay:uid:' .. id .. ':jail')
-            redis.call('DEL', 'limit:relay:uid:' .. id .. ':viol')
-            redis.call('DEL', 'limit:media:uid:' .. id)
-            redis.call('DEL', 'limit:media:uid:' .. id .. ':jail')
-            redis.call('DEL', 'limit:media:uid:' .. id .. ':viol')
-            redis.call('DEL', 'limit:keys_up:uid:' .. id)
-            redis.call('DEL', 'limit:nick:reg:' .. id)
-            redis.call('SREM', 'active_users', id)
-            return 1
-        ";
-        let _: i32 = redis::Script::new(script).arg(user_hash).invoke_async(&mut conn).await?;
+        
+        let rn_key = self.blind_key("rn", user_hash);
+        let keys_key = self.blind_key("keys", user_hash);
+        let active_uid_key = self.blind_key("uid", user_hash);
+        let msg_key = format!("msg:{}", active_uid_key);
+        let offsenders_key = format!("offsenders:{}", active_uid_key);
+        let sess_key = self.blind_key("sess", user_hash);
+        let seen_key = self.blind_key("seen", user_hash);
+        let otk_key = self.blind_key("otk", user_hash);
+
+        if let Ok(Some(masked_nick)) = conn.get::<_, Option<String>>(&rn_key).await {
+            if let Some(nick) = self.unmask_value(&masked_nick, user_hash) {
+                 let _: () = conn.del(self.blind_key("nick", &nick)).await?;
+            }
+        }
+        
+        let _: () = conn.del(&rn_key).await?;
+        let _: () = conn.del(&keys_key).await?;
+        let _: () = conn.del(&msg_key).await?;
+        
+        let senders: Vec<String> = conn.smembers(&offsenders_key).await.unwrap_or_default();
+        for sc_key in senders {
+            let _: () = conn.del(sc_key).await?;
+        }
+        let _: () = conn.del(&offsenders_key).await?;
+        
+        let _: () = conn.del(&sess_key).await?;
+        let _: () = conn.del(&seen_key).await?;
+        let _: () = conn.del(&otk_key).await?;
+        
+        let _: () = conn.del(format!("limit:relay:{}", active_uid_key)).await?;
+        let _: () = conn.del(format!("limit:relay:{}:jail", active_uid_key)).await?;
+        let _: () = conn.del(format!("limit:relay:{}:viol", active_uid_key)).await?;
+        let _: () = conn.del(format!("limit:media:{}", active_uid_key)).await?;
+        let _: () = conn.del(format!("limit:media:{}:jail", active_uid_key)).await?;
+        let _: () = conn.del(format!("limit:media:{}:viol", active_uid_key)).await?;
+        let _: () = conn.del(format!("limit:keys_up:{}", active_uid_key)).await?;
+        let _: () = conn.del(format!("limit:nick:reg:{}", active_uid_key)).await?;
+        let _: () = conn.srem("active_users", &active_uid_key).await?;
+        
         Ok(true)
     }
 
     pub async fn refresh_nickname_ttl(&self, user_hash: &str) -> Result<()> {
         let mut conn = self.connection.clone();
-        let owner_key = format!("rn:{}", user_hash);
-        if let Ok(Some(nick)) = conn.get::<_, Option<String>>(&owner_key).await {
-            let _: () = conn.expire(format!("nick:{}", nick), 2592000).await?;
-            let _: () = conn.expire(&owner_key, 2592000).await?;
+        let owner_key = self.blind_key("rn", user_hash);
+        if let Ok(Some(masked_nick)) = conn.get::<_, Option<String>>(&owner_key).await {
+            if let Some(nick) = self.unmask_value(&masked_nick, user_hash) {
+                let _: () = conn.expire(self.blind_key("nick", &nick), 2592000).await?;
+                let _: () = conn.expire(&owner_key, 2592000).await?;
+            }
         }
         Ok(())
     }
@@ -530,14 +626,16 @@ impl RedisManager {
         hasher.update(token.as_bytes());
         let token_hash = hex::encode(hasher.finalize());
         
-        let key = format!("sess:{}", user_hash);
-        let _: () = conn.set_ex(&key, &token_hash, ttl_sec).await?;
+        let key = self.blind_key("sess", user_hash);
+        let res: Result<(), _> = conn.set_ex(&key, &token_hash, ttl_sec).await;
+        if res.is_err() { self.metrics.increment_counter("redis_errors_total", 1.0); }
+        res?;
         Ok(token)
     }
 
     pub async fn revoke_session_token(&self, user_hash: &str) -> Result<()> {
         let mut conn = self.connection.clone();
-        let key = format!("sess:{}", user_hash);
+        let key = self.blind_key("sess", user_hash);
         let _: () = conn.del(&key).await?;
         Ok(())
     }
@@ -545,7 +643,7 @@ impl RedisManager {
     pub async fn verify_session_token(&self, user_hash: &str, token: &str) -> Result<bool> {
         if token.is_empty() { return Ok(false); }
         let mut conn = self.connection.clone();
-        let key = format!("sess:{}", user_hash);
+        let key = self.blind_key("sess", user_hash);
         let val: Option<String> = conn.get(&key).await?;
         if let Some(stored_hash) = val {
             let mut hasher = Sha256::new();
@@ -583,10 +681,12 @@ impl RedisManager {
 mod tests {
     use super::*;
     use crate::config::ServerConfig;
+    use crate::telemetry::metrics::Metrics;
 
     async fn setup_redis() -> Arc<RedisManager> {
         let config = Arc::new(ServerConfig::test_default());
-        RedisManager::new(config).await.unwrap()
+        let metrics = Metrics::new();
+        RedisManager::new(config, metrics).await.unwrap()
     }
 
     #[tokio::test]

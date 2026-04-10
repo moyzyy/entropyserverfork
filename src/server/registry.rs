@@ -4,6 +4,7 @@ use crate::relay::QueuedMessage;
 
 pub type MessageSender = mpsc::UnboundedSender<QueuedMessage>;
 
+#[derive(Default)]
 pub struct Registry {
     connections: DashMap<String, MessageSender>,
     total_connections: std::sync::atomic::AtomicUsize,
@@ -11,10 +12,7 @@ pub struct Registry {
 
 impl Registry {
     pub fn new() -> Self {
-        Self {
-            connections: DashMap::new(),
-            total_connections: std::sync::atomic::AtomicUsize::new(0),
-        }
+        Self::default()
     }
 
     pub fn add_connection(&self, identity_hash: String, sender: MessageSender) -> Option<MessageSender> {

@@ -37,8 +37,7 @@ pub struct AppState {
     pub health: Arc<HealthHandler>,
 }
 
-pub async fn app(config: Arc<ServerConfig>, redis: Arc<RedisManager>) -> anyhow::Result<Router> {
-    let metrics = Metrics::new();
+pub async fn app(config: Arc<ServerConfig>, redis: Arc<RedisManager>, metrics: Arc<Metrics>) -> anyhow::Result<Router> {
     let registry = Arc::new(Registry::new());
     let relay = Arc::new(MessageRelay::new(registry.clone(), redis.clone(), config.clone(), metrics.clone()));
     let identity_handler = Arc::new(IdentityHandler::new(redis.clone(), registry.clone(), config.clone()));
