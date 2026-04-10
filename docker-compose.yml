@@ -4,24 +4,34 @@ services:
   entropy:
     build: .
     container_name: entropy_relay
+    restart: always
     ports:
       - "8080:8080"
     env_file:
       - .env.production
-    environment:
-      - ENTROPY_ADDR=0.0.0.0
-      - ENTROPY_REDIS_URL=redis://cache:6379
     depends_on:
-      - cache
-    restart: always
+      cache:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.8'
+          memory: 512M
+        reservations:
+          memory: 128M
 
   cache:
     image: redis:7-alpine
     container_name: entropy_redis
-    command: redis-server --save 60 1 --loglevel warning
-    volumes:
-      - redis_data:/data
     restart: always
+    # Ghost Mode: 100% RAM-based. No disk traces.
+    command: ["redis-server", "--requirepass", "${ENTROPY_REDIS_PASSWORD}", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no", "--loglevel", "warning"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${ENTROPY_REDIS_PASSWORD}", "ping"]
+      interval: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
-volumes:
-  redis_data:
+# volumes section removed for 100% ephemerality
