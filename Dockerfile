@@ -1,5 +1,5 @@
 # Stage 1: Chef (Prepare recipe)
-FROM lukemathwalker/cargo-chef:latest-rust-1.80-alpine AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.94-alpine AS chef
 WORKDIR /app
 RUN apk add --no-cache musl-dev openssl-dev perl make
 
